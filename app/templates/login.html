@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card auth-card">
+    <div class="card-header">
+        <h1>Welcome back</h1>
+        <p>Sign in to manage your agents and tools.</p>
+    </div>
+    <form method="post" class="form-stack">
+        <label>
+            <span>Email</span>
+            <input type="email" name="email" placeholder="you@example.com" required />
+        </label>
+        <label>
+            <span>Password</span>
+            <input type="password" name="password" placeholder="Your password" required />
+        </label>
+        {% if error %}
+        <div class="form-error">{{ error }}</div>
+        {% endif %}
+        <button class="btn" type="submit">Sign in</button>
+    </form>
+    <div class="form-footer">
+        <span>New here?</span>
+        <a href="/auth/register">Create an account</a>
+    </div>
+</section>
+{% endblock %}

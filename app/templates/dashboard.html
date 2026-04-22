@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card dashboard">
+    <div class="card-header">
+        <h1>Dashboard</h1>
+        <p>Your workspace is ready. Phase 1 auth is active.</p>
+    </div>
+    <div class="details-grid">
+        <div class="detail">
+            <span class="detail-label">User</span>
+            <span class="detail-value">{{ user.full_name or "Unnamed" }}</span>
+        </div>
+        <div class="detail">
+            <span class="detail-label">Email</span>
+            <span class="detail-value">{{ user.email }}</span>
+        </div>
+        <div class="detail">
+            <span class="detail-label">Account ID</span>
+            <span class="detail-value">{{ user.id }}</span>
+        </div>
+        <div class="detail">
+            <span class="detail-label">Status</span>
+            <span class="detail-value">Active</span>
+        </div>
+    </div>
+    <div class="info-panel">
+        <h2>Next steps</h2>
+        <ul>
+            <li>Connect Telegram in Phase 2.</li>
+            <li>Enable tool registry in Phase 4.</li>
+            <li>Build agent listing by category in Phase 6.</li>
+        </ul>
+    </div>
+</section>
+{% endblock %}

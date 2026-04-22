@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or "AI Agent System" }}</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <div class="page">
+        <header class="top-bar">
+            <div class="brand">
+                <span class="brand-mark">AI</span>
+                <span class="brand-text">Agent Control</span>
+            </div>
+            {% if user %}
+            <nav class="nav-links">
+                <a href="/dashboard">Dashboard</a>
+                <a href="/auth/logout">Sign out</a>
+            </nav>
+            {% endif %}
+        </header>
+        <main class="content">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+</body>
+</html>

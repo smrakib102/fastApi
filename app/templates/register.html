@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card auth-card">
+    <div class="card-header">
+        <h1>Create your account</h1>
+        <p>Get started with a secure, multi-user workspace.</p>
+    </div>
+    <form method="post" class="form-stack">
+        <label>
+            <span>Full name</span>
+            <input type="text" name="full_name" placeholder="Your name" />
+        </label>
+        <label>
+            <span>Email</span>
+            <input type="email" name="email" placeholder="you@example.com" required />
+        </label>
+        <label>
+            <span>Password</span>
+            <input type="password" name="password" placeholder="At least 8 characters" required />
+        </label>
+        {% if error %}
+        <div class="form-error">{{ error }}</div>
+        {% endif %}
+        <button class="btn" type="submit">Create account</button>
+    </form>
+    <div class="form-footer">
+        <span>Already have an account?</span>
+        <a href="/auth/login">Sign in</a>
+    </div>
+</section>
+{% endblock %}
