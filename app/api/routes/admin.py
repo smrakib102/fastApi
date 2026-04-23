@@ -1,18 +1,23 @@
 from pathlib import Path
 
+import secrets
+
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_admin, require_admin_user
+from app.api.deps import get_current_user, get_db, require_admin, require_admin_user
+from app.core.config import settings
+from app.core.redis_client import get_redis
 from app.core.crypto import encrypt_value, mask_value
-from app.core.security import hash_password
+from app.core.security import create_access_token, hash_password
 from app.models.admin_setting import AdminSetting
 from app.models.user import User
 from app.models.user_limit import UserLimit
 from app.services.audit_log import record_audit
+from app.services.email_service import send_email
 
 router = APIRouter()
 
@@ -41,6 +46,147 @@ def bootstrap_admin(email: str = Form(...), db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     return {"ok": True, "admin_user_id": user.id}
+
+
+@router.get("/login", response_class=HTMLResponse)
+def admin_login_page(request: Request, current_user: User | None = Depends(get_current_user)):
+    if current_user and current_user.is_admin:
+        return RedirectResponse("/admin/panel", status_code=303)
+    return templates.TemplateResponse("admin_login.html", {"request": request})
+
+
+@router.post("/login")
+def admin_login_send(request: Request, email: str = Form(...), db: Session = Depends(get_db)):
+    normalized_email = email.strip().lower()
+    user = db.execute(select(User).where(User.email == normalized_email)).scalar_one_or_none()
+    if not user or not user.is_admin or not user.is_active or user.is_locked:
+        return templates.TemplateResponse(
+            "admin_login.html",
+            {
+                "request": request,
+                "message": "If the email is eligible, a code has been sent.",
+            },
+        )
+
+    redis_client = get_redis()
+    rate_key = f"admin:otp:sent:{normalized_email}"
+    if redis_client.get(rate_key):
+        return templates.TemplateResponse(
+            "admin_login.html",
+            {
+                "request": request,
+                "error": "Please wait a minute before requesting another code.",
+            },
+        )
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    redis_client.setex(
+        f"admin:otp:{normalized_email}",
+        settings.admin_otp_ttl_seconds,
+        code,
+    )
+    redis_client.setex(rate_key, settings.admin_otp_rate_seconds, "1")
+    redis_client.delete(f"admin:otp:attempts:{normalized_email}")
+
+    try:
+        send_email(
+            to_address=normalized_email,
+            subject="Your admin login code",
+            body=(
+                "Your admin login code is: "
+                f"{code}\n\nThis code expires in "
+                f"{settings.admin_otp_ttl_seconds // 60} minutes."
+            ),
+        )
+    except ValueError:
+        return templates.TemplateResponse(
+            "admin_login.html",
+            {
+                "request": request,
+                "error": "Email delivery is not configured. Contact the administrator.",
+            },
+            status_code=500,
+        )
+
+    return templates.TemplateResponse(
+        "admin_verify.html",
+        {"request": request, "email": normalized_email, "message": "Code sent."},
+    )
+
+
+@router.post("/verify")
+def admin_login_verify(
+    request: Request,
+    email: str = Form(...),
+    code: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    normalized_email = email.strip().lower()
+    user = db.execute(select(User).where(User.email == normalized_email)).scalar_one_or_none()
+    if not user or not user.is_admin or not user.is_active or user.is_locked:
+        return templates.TemplateResponse(
+            "admin_verify.html",
+            {
+                "request": request,
+                "email": normalized_email,
+                "error": "Invalid code.",
+            },
+            status_code=400,
+        )
+
+    redis_client = get_redis()
+    expected = redis_client.get(f"admin:otp:{normalized_email}")
+    if not expected:
+        return templates.TemplateResponse(
+            "admin_verify.html",
+            {
+                "request": request,
+                "email": normalized_email,
+                "error": "Code expired. Please request a new one.",
+            },
+            status_code=400,
+        )
+
+    if code.strip() != expected:
+        attempts_key = f"admin:otp:attempts:{normalized_email}"
+        attempts = redis_client.incr(attempts_key)
+        if attempts == 1:
+            redis_client.expire(attempts_key, settings.admin_otp_ttl_seconds)
+        if attempts >= settings.admin_otp_max_attempts:
+            redis_client.delete(f"admin:otp:{normalized_email}")
+            return templates.TemplateResponse(
+                "admin_verify.html",
+                {
+                    "request": request,
+                    "email": normalized_email,
+                    "error": "Too many attempts. Please request a new code.",
+                },
+                status_code=400,
+            )
+        return templates.TemplateResponse(
+            "admin_verify.html",
+            {
+                "request": request,
+                "email": normalized_email,
+                "error": "Invalid code.",
+            },
+            status_code=400,
+        )
+
+    redis_client.delete(f"admin:otp:{normalized_email}")
+    redis_client.delete(f"admin:otp:attempts:{normalized_email}")
+
+    token = create_access_token(str(user.id))
+    response = RedirectResponse("/admin/panel", status_code=303)
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=settings.environment != "local",
+    )
+    record_audit(db, user.id, "admin_otp_login", "user", str(user.id))
+    return response
 
 
 @router.get("/settings")

@@ -148,6 +148,14 @@ input:focus {
     font-size: 0.9rem;
 }
 
+.form-success {
+    color: #166534;
+    background: #dcfce7;
+    padding: 10px 12px;
+    border-radius: 12px;
+    font-size: 0.9rem;
+}
+
 .form-footer {
     margin-top: 18px;
     display: flex;

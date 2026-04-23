@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     telegram_link_ttl_seconds: int = 600
     telegram_prompt_ttl_seconds: int = 600
     google_oauth_state_ttl_seconds: int = 600
+    admin_otp_ttl_seconds: int = 600
+    admin_otp_rate_seconds: int = 60
+    admin_otp_max_attempts: int = 5
     auth_secret_key: str = "change-me"
     auth_algorithm: str = "HS256"
     auth_access_token_minutes: int = 60
@@ -29,6 +32,13 @@ class Settings(BaseSettings):
     auth_token_issuer: str = "ai-agent-system"
     legacy_user_email: str = "legacy@local"
     secrets_master_key: str | None = None
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None
+    smtp_tls: bool = True
+    smtp_ssl: bool = False
 
     class Config:
         env_file = ".env"

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card auth-card">
+    <div class="card-header">
+        <h1>Enter admin code</h1>
+        <p>We sent a 6-digit code to {{ email }}.</p>
+    </div>
+    <form method="post" class="form-stack" action="/admin/verify">
+        <input type="hidden" name="email" value="{{ email }}" />
+        <label>
+            <span>Code</span>
+            <input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" placeholder="123456" required />
+        </label>
+        {% if error %}
+        <div class="form-error">{{ error }}</div>
+        {% endif %}
+        {% if message %}
+        <div class="form-success">{{ message }}</div>
+        {% endif %}
+        <button class="btn" type="submit">Verify</button>
+    </form>
+    <div class="form-footer">
+        <span>Need a new code?</span>
+        <a href="/admin/login">Send again</a>
+    </div>
+</section>
+{% endblock %}
