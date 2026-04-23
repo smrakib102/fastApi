@@ -24,12 +24,6 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def require_admin_user(current_user: User | None = Depends(get_current_user)) -> User:
-    if not current_user or not current_user.is_admin or not current_user.is_active or current_user.is_locked:
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return current_user
-
-
 def get_legacy_user(db: Session) -> User:
     legacy_email = settings.legacy_user_email
     user = db.execute(select(User).where(User.email == legacy_email)).scalar_one_or_none()
@@ -73,6 +67,12 @@ def get_current_user(
         return None
 
     return db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+
+
+def require_admin_user(current_user: User | None = Depends(get_current_user)) -> User:
+    if not current_user or not current_user.is_admin or not current_user.is_active or current_user.is_locked:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
 
 
 def require_user(current_user: User | None = Depends(get_current_user)) -> User:
