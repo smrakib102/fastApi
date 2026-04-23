@@ -25,12 +25,23 @@ def _get_bot_token(db: Session) -> str | None:
     return setting.value if setting and setting.value else settings.telegram_bot_token
 
 
-def _send_telegram_message(db: Session, chat_id: str, text: str) -> None:
+def _send_telegram_message(
+    db: Session,
+    chat_id: str,
+    text: str,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = None,
+) -> None:
     bot_token = _get_bot_token(db)
     if not bot_token:
         return
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    httpx.post(url, json={"chat_id": chat_id, "text": text}, timeout=20)
+    payload: dict = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    httpx.post(url, json=payload, timeout=20)
 
 
 @router.get("")
@@ -133,12 +144,26 @@ def request_tool_access(
         select(TelegramLink).where(TelegramLink.user_id == current_user.id)
     ).scalar_one_or_none()
     if link:
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "Connect OAuth", "callback_data": f"toolreq:oauth:{request.id}"},
+                    {"text": "Add API key", "callback_data": f"toolreq:apikey:{request.id}"},
+                ],
+                [
+                    {"text": "Skip", "callback_data": f"toolreq:skip:{request.id}"},
+                ],
+            ]
+        }
+        details_text = f"\n<pre>{details}</pre>" if details else ""
         _send_telegram_message(
             db,
             link.telegram_user_id,
-            "Tool access needed: {name}\nReply with /setkey {name} <API_KEY>".format(
-                name=tool_name
-            ),
+            "<b>Tool access needed</b>\n"
+            f"Tool: <code>{tool_name}</code>{details_text}\n\n"
+            "Choose one option below:",
+            reply_markup=keyboard,
+            parse_mode="HTML",
         )
 
     return {"ok": True, "request_id": request.id}

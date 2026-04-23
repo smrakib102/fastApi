@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str | None = None
     telegram_bot_username: str | None = None
     telegram_link_ttl_seconds: int = 600
+    telegram_prompt_ttl_seconds: int = 600
     google_oauth_state_ttl_seconds: int = 600
     auth_secret_key: str = "change-me"
     auth_algorithm: str = "HS256"
