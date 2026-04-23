@@ -18,6 +18,6 @@ def record_audit(
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
-            metadata=json.dumps(metadata or {}, ensure_ascii=True),
+            meta=json.dumps(metadata or {}, ensure_ascii=True),
         )
     )

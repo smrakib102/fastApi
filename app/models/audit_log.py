@@ -12,5 +12,5 @@ class AuditLog(Base):
     action = Column(String(120), nullable=False)
     resource_type = Column(String(120), nullable=False)
     resource_id = Column(String(120), nullable=True)
-    metadata = Column(Text, nullable=True)
+    meta = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

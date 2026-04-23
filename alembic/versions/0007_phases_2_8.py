@@ -120,7 +120,7 @@ def upgrade() -> None:
         sa.Column("action", sa.String(length=120), nullable=False),
         sa.Column("resource_type", sa.String(length=120), nullable=False),
         sa.Column("resource_id", sa.String(length=120), nullable=True),
-        sa.Column("metadata", sa.Text(), nullable=True),
+        sa.Column("meta", sa.Text(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
