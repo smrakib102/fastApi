@@ -55,6 +55,7 @@ def update_settings(
     openai_api_key: str | None = Form(default=None),
     gemini_api_key: str | None = Form(default=None),
     default_model_provider: str | None = Form(default=None),
+    code_model_provider: str | None = Form(default=None),
 ):
     if telegram_bot_token is not None:
         _upsert_setting(db, "telegram_bot_token", telegram_bot_token)
@@ -66,6 +67,8 @@ def update_settings(
         _upsert_setting(db, "gemini_api_key", gemini_api_key)
     if default_model_provider is not None:
         _upsert_setting(db, "default_model_provider", default_model_provider)
+    if code_model_provider is not None:
+        _upsert_setting(db, "code_model_provider", code_model_provider)
 
     return {"ok": True}
 
@@ -131,6 +134,7 @@ def admin_panel_settings(
     openai_api_key: str | None = Form(default=None),
     gemini_api_key: str | None = Form(default=None),
     default_model_provider: str | None = Form(default=None),
+    code_model_provider: str | None = Form(default=None),
 ):
     if telegram_bot_token is not None:
         _upsert_setting(db, "telegram_bot_token", telegram_bot_token)
@@ -142,6 +146,8 @@ def admin_panel_settings(
         _upsert_setting(db, "gemini_api_key", gemini_api_key)
     if default_model_provider is not None:
         _upsert_setting(db, "default_model_provider", default_model_provider)
+    if code_model_provider is not None:
+        _upsert_setting(db, "code_model_provider", code_model_provider)
 
     return RedirectResponse("/admin/panel", status_code=303)
 

@@ -130,6 +130,9 @@
                         <div class="agent-title">{{ agent.name }}</div>
                         <div class="agent-meta">{{ agent.role }} · {{ agent.category }}</div>
                         <div class="agent-meta">Model: {{ agent.model }}</div>
+                        {% if agent.model == "auto" %}
+                            <div class="agent-meta">Provider: {{ agent.resolved_provider or "unavailable" }}</div>
+                        {% endif %}
                         <div class="agent-meta">Status: {{ agent.status }}</div>
                     </div>
                 {% endfor %}

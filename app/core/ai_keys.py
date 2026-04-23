@@ -22,3 +22,19 @@ def get_default_provider(db: Session) -> str | None:
         select(AdminSetting).where(AdminSetting.key == "default_model_provider")
     ).scalar_one_or_none()
     return setting.value if setting and setting.value else None
+
+
+def get_code_provider(db: Session) -> str | None:
+    setting = db.execute(
+        select(AdminSetting).where(AdminSetting.key == "code_model_provider")
+    ).scalar_one_or_none()
+    return setting.value if setting and setting.value else None
+
+
+def get_available_providers(db: Session, user_id: int) -> set[str]:
+    available: set[str] = set()
+    if get_user_key(db, user_id, "openai"):
+        available.add("openai")
+    if get_user_key(db, user_id, "gemini"):
+        available.add("gemini")
+    return available

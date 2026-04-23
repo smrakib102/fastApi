@@ -29,6 +29,10 @@
                 <span>Default model provider</span>
                 <input type="text" name="default_model_provider" placeholder="openai or gemini" value="{{ settings.get('default_model_provider', '') }}" />
             </label>
+            <label>
+                <span>Code model provider</span>
+                <input type="text" name="code_model_provider" placeholder="openai or gemini" value="{{ settings.get('code_model_provider', '') }}" />
+            </label>
             <button class="btn" type="submit">Save settings</button>
         </form>
     </div>

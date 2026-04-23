@@ -6,6 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_user
+from app.core.ai_keys import get_code_provider, get_default_provider
+from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
 from app.models.user import User
 
@@ -30,6 +32,8 @@ def list_agents(
     if category:
         query = query.where(Agent.category == category)
     agents = db.execute(query).scalars().all()
+    default_provider = get_default_provider(db)
+    code_provider = get_code_provider(db)
     return {
         "items": [
             {
@@ -40,6 +44,16 @@ def list_agents(
                 "tools": json.loads(agent.tools or "[]"),
                 "category": agent.category,
                 "status": agent.status,
+                "resolved_provider": resolve_provider(
+                    db,
+                    current_user.id,
+                    agent.role,
+                    agent.category,
+                    default_provider,
+                    code_provider,
+                )
+                if agent.model == "auto"
+                else None,
             }
             for agent in agents
         ]
@@ -68,6 +82,8 @@ def create_agent(
     db.add(agent)
     db.commit()
     db.refresh(agent)
+    default_provider = get_default_provider(db)
+    code_provider = get_code_provider(db)
     return {
         "id": agent.id,
         "name": agent.name,
@@ -76,4 +92,14 @@ def create_agent(
         "tools": json.loads(agent.tools or "[]"),
         "category": agent.category,
         "status": agent.status,
+        "resolved_provider": resolve_provider(
+            db,
+            current_user.id,
+            agent.role,
+            agent.category,
+            default_provider,
+            code_provider,
+        )
+        if agent.model == "auto"
+        else None,
     }

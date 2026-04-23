@@ -9,6 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.core.ai_keys import get_code_provider, get_default_provider
+from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
 from app.models.team_agent import TeamAgent
 from app.models.user_profile import UserProfile
@@ -82,6 +84,21 @@ def dashboard_agents(
         )
     ).scalars().all()
     key_map = {item.key: item.value for item in keys}
+
+    default_provider = get_default_provider(db)
+    code_provider = get_code_provider(db)
+    for agent in agents:
+        if agent.model == "auto":
+            agent.resolved_provider = resolve_provider(
+                db,
+                current_user.id,
+                agent.role,
+                agent.category,
+                default_provider,
+                code_provider,
+            )
+        else:
+            agent.resolved_provider = None
 
     return templates.TemplateResponse(
         "dashboard.html",
