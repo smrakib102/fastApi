@@ -11,6 +11,7 @@ from app.api.deps import get_db, get_legacy_user
 from app.api.routes.google_oauth import _ensure_token, _get_default_account
 from app.core.config import settings
 from app.models.approval import Approval
+from app.services.usage_limits import check_and_record_usage
 
 router = APIRouter()
 
@@ -306,6 +307,17 @@ def tool_execute(
     db: Session = Depends(get_db),
 ):
     _require_tool_token(x_tool_token)
+
+    usage_provider = payload.arguments.get("provider")
+    usage_tokens = payload.arguments.get("tokens")
+    usage_user_id = payload.arguments.get("user_id")
+    if usage_provider and usage_tokens and usage_user_id:
+        check_and_record_usage(
+            db,
+            int(usage_user_id),
+            str(usage_provider),
+            int(usage_tokens),
+        )
 
     if payload.name == "gmail.draft":
         return _gmail_draft(payload.arguments, db)

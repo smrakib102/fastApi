@@ -36,7 +36,7 @@
             </label>
             <label>
                 <span>Model</span>
-                <input type="text" name="model" value="openai-codex/gpt-5.4" required />
+                <input type="text" name="model" value="auto" required />
             </label>
             <label>
                 <span>Category</span>
@@ -48,6 +48,24 @@
             </label>
             <button class="btn" type="submit">Create agent</button>
         </form>
+    </div>
+
+    <div class="info-panel">
+        <h2>Your AI keys (optional overrides)</h2>
+        <form class="form-stack" method="post" action="/dashboard/keys">
+            <label>
+                <span>OpenAI API key</span>
+                <input type="text" name="openai_api_key" placeholder="Leave empty to use admin key" />
+            </label>
+            <label>
+                <span>Gemini API key</span>
+                <input type="text" name="gemini_api_key" placeholder="Leave empty to use admin key" />
+            </label>
+            <button class="btn" type="submit">Save keys</button>
+        </form>
+        <p class="muted">
+            OpenAI configured: {{ "yes" if key_map.get("openai_api_key") else "no" }} · Gemini configured: {{ "yes" if key_map.get("gemini_api_key") else "no" }}
+        </p>
     </div>
 
     <div class="info-panel">
@@ -73,6 +91,28 @@
                     <div class="agent-card">
                         <div class="agent-title">{{ team.name }}</div>
                         <div class="agent-meta">{{ team.description or "No description" }}</div>
+                        <div class="agent-meta">
+                            Members:
+                            {% if team_agents and team_agents.get(team.id) %}
+                                {{ team_agents.get(team.id) | map(attribute='name') | join(', ') }}
+                            {% else %}
+                                none
+                            {% endif %}
+                        </div>
+                        {% if agents and agents|length > 0 %}
+                            <form class="form-stack" method="post" action="/dashboard/teams/assign">
+                                <input type="hidden" name="team_id" value="{{ team.id }}" />
+                                <label>
+                                    <span>Add agent</span>
+                                    <select name="agent_id">
+                                        {% for agent in agents %}
+                                            <option value="{{ agent.id }}">{{ agent.name }}</option>
+                                        {% endfor %}
+                                    </select>
+                                </label>
+                                <button class="btn" type="submit">Add to team</button>
+                            </form>
+                        {% endif %}
                     </div>
                 {% endfor %}
             </div>

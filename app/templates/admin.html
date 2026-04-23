@@ -25,6 +25,10 @@
                 <span>Gemini API key</span>
                 <input type="text" name="gemini_api_key" value="{{ settings.get('gemini_api_key', '') }}" />
             </label>
+            <label>
+                <span>Default model provider</span>
+                <input type="text" name="default_model_provider" placeholder="openai or gemini" value="{{ settings.get('default_model_provider', '') }}" />
+            </label>
             <button class="btn" type="submit">Save settings</button>
         </form>
     </div>
