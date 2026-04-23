@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card dashboard">
+    <div class="card-header">
+        <h1>Admin Panel</h1>
+        <p>Global keys, Telegram settings, and per-user limits.</p>
+    </div>
+
+    <div class="info-panel">
+        <h2>Global Settings</h2>
+        <form class="form-stack" method="post" action="/admin/panel/settings">
+            <label>
+                <span>Telegram bot token</span>
+                <input type="text" name="telegram_bot_token" value="{{ settings.get('telegram_bot_token', '') }}" />
+            </label>
+            <label>
+                <span>Telegram bot username</span>
+                <input type="text" name="telegram_bot_username" value="{{ settings.get('telegram_bot_username', '') }}" />
+            </label>
+            <label>
+                <span>OpenAI API key</span>
+                <input type="text" name="openai_api_key" value="{{ settings.get('openai_api_key', '') }}" />
+            </label>
+            <label>
+                <span>Gemini API key</span>
+                <input type="text" name="gemini_api_key" value="{{ settings.get('gemini_api_key', '') }}" />
+            </label>
+            <button class="btn" type="submit">Save settings</button>
+        </form>
+    </div>
+
+    <div class="info-panel">
+        <h2>User Limits</h2>
+        <form class="form-stack" method="post" action="/admin/panel/limits">
+            <label>
+                <span>User ID</span>
+                <input type="number" name="user_id" required />
+            </label>
+            <label>
+                <span>Provider</span>
+                <input type="text" name="provider" placeholder="openai, gemini" required />
+            </label>
+            <label>
+                <span>Daily limit (tokens)</span>
+                <input type="number" name="daily_limit" />
+            </label>
+            <label>
+                <span>Monthly limit (tokens)</span>
+                <input type="number" name="monthly_limit" />
+            </label>
+            <button class="btn" type="submit">Save limit</button>
+        </form>
+    </div>
+
+    <div class="info-panel">
+        <h2>Existing Limits</h2>
+        {% if limits and limits|length > 0 %}
+            <div class="agent-grid">
+                {% for limit in limits %}
+                    <div class="agent-card">
+                        <div class="agent-title">User {{ limit.user_id }} · {{ limit.provider }}</div>
+                        <div class="agent-meta">Daily: {{ limit.daily_limit or 'none' }}</div>
+                        <div class="agent-meta">Monthly: {{ limit.monthly_limit or 'none' }}</div>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="muted">No limits set yet.</p>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}

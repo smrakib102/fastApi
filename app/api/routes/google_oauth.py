@@ -2,13 +2,17 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_legacy_user, require_admin
+from app.api.deps import get_db, require_user
 from app.core.config import settings
+from app.core.redis_client import get_redis
 from app.models.google_account import GoogleAccount
+from app.models.user import User
 
 router = APIRouter()
 
@@ -32,12 +36,9 @@ def _build_scopes() -> str:
     return " ".join(scope_list)
 
 
-def _get_default_account(db: Session) -> GoogleAccount:
-    legacy_user = get_legacy_user(db)
+def _get_default_account(db: Session, user_id: int) -> GoogleAccount:
     account = db.execute(
-        select(GoogleAccount).where(
-            or_(GoogleAccount.user_id == legacy_user.id, GoogleAccount.user_id.is_(None))
-        )
+        select(GoogleAccount).where(GoogleAccount.user_id == user_id)
     ).scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="No Google account connected")
@@ -79,9 +80,17 @@ def _ensure_token(db: Session, account: GoogleAccount) -> GoogleAccount:
     return account
 
 
-@router.get("/oauth/start", dependencies=[Depends(require_admin)])
-def google_oauth_start():
+@router.get("/oauth/start")
+def google_oauth_start(current_user: User = Depends(require_user)):
     _require_google_config()
+
+    state_token = secrets.token_urlsafe(32)
+    redis_client = get_redis()
+    redis_client.setex(
+        f"oauth:state:{state_token}",
+        settings.google_oauth_state_ttl_seconds,
+        str(current_user.id),
+    )
 
     params = {
         "client_id": settings.google_oauth_client_id,
@@ -90,6 +99,7 @@ def google_oauth_start():
         "access_type": "offline",
         "prompt": "consent",
         "scope": _build_scopes(),
+        "state": state_token,
     }
     return {"url": f"{GOOGLE_AUTH_URL}?{urlencode(params)}"}
 
@@ -97,9 +107,17 @@ def google_oauth_start():
 @router.get("/oauth/callback")
 def google_oauth_callback(
     code: str = Query(...),
+    state: str = Query(...),
     db: Session = Depends(get_db),
 ):
     _require_google_config()
+
+    redis_client = get_redis()
+    state_key = f"oauth:state:{state}"
+    user_id = redis_client.get(state_key)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="OAuth state is invalid or expired")
+    redis_client.delete(state_key)
 
     payload = {
         "client_id": settings.google_oauth_client_id,
@@ -135,10 +153,8 @@ def google_oauth_callback(
     if not account:
         account = GoogleAccount(account_email=account_email, access_token=access_token)
 
-    legacy_user = get_legacy_user(db)
     account.access_token = access_token
-    if not account.user_id:
-        account.user_id = legacy_user.id
+    account.user_id = int(user_id)
     if refresh_token:
         account.refresh_token = refresh_token
     account.token_type = token_type
@@ -153,9 +169,12 @@ def google_oauth_callback(
     return {"ok": True, "email": account.account_email}
 
 
-@router.get("/gmail/profile", dependencies=[Depends(require_admin)])
-def gmail_profile(db: Session = Depends(get_db)):
-    account = _ensure_token(db, _get_default_account(db))
+@router.get("/gmail/profile")
+def gmail_profile(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    account = _ensure_token(db, _get_default_account(db, current_user.id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     response = httpx.get(GMAIL_PROFILE_URL, headers=headers, timeout=30)
     if response.status_code != 200:
@@ -163,9 +182,12 @@ def gmail_profile(db: Session = Depends(get_db)):
     return response.json()
 
 
-@router.get("/calendar/list", dependencies=[Depends(require_admin)])
-def calendar_list(db: Session = Depends(get_db)):
-    account = _ensure_token(db, _get_default_account(db))
+@router.get("/calendar/list")
+def calendar_list(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    account = _ensure_token(db, _get_default_account(db, current_user.id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     response = httpx.get(CALENDAR_LIST_URL, headers=headers, timeout=30)
     if response.status_code != 200:

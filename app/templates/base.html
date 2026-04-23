@@ -15,7 +15,10 @@
             </div>
             {% if user %}
             <nav class="nav-links">
-                <a href="/dashboard">Dashboard</a>
+                <a href="/dashboard/agents">Dashboard</a>
+                {% if user.is_admin %}
+                <a href="/admin/panel">Admin</a>
+                {% endif %}
                 <a href="/auth/logout">Sign out</a>
             </nav>
             {% endif %}

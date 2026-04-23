@@ -24,12 +24,79 @@
         </div>
     </div>
     <div class="info-panel">
-        <h2>Next steps</h2>
-        <ul>
-            <li>Connect Telegram in Phase 2.</li>
-            <li>Enable tool registry in Phase 4.</li>
-            <li>Build agent listing by category in Phase 6.</li>
-        </ul>
+        <h2>Create an agent</h2>
+        <form class="form-stack" method="post" action="/dashboard/agents">
+            <label>
+                <span>Name</span>
+                <input type="text" name="name" required />
+            </label>
+            <label>
+                <span>Role</span>
+                <input type="text" name="role" placeholder="Sales assistant" required />
+            </label>
+            <label>
+                <span>Model</span>
+                <input type="text" name="model" value="openai-codex/gpt-5.4" required />
+            </label>
+            <label>
+                <span>Category</span>
+                <input type="text" name="category" value="general" />
+            </label>
+            <label>
+                <span>Tools (comma-separated)</span>
+                <input type="text" name="tools" placeholder="gmail.list_messages, calendar.list" />
+            </label>
+            <button class="btn" type="submit">Create agent</button>
+        </form>
+    </div>
+
+    <div class="info-panel">
+        <h2>Create a team</h2>
+        <form class="form-stack" method="post" action="/dashboard/teams">
+            <label>
+                <span>Team name</span>
+                <input type="text" name="name" required />
+            </label>
+            <label>
+                <span>Description</span>
+                <input type="text" name="description" placeholder="Marketing, Content, Sales" />
+            </label>
+            <button class="btn" type="submit">Create team</button>
+        </form>
+    </div>
+
+    <div class="info-panel">
+        <h2>Your teams</h2>
+        {% if teams and teams|length > 0 %}
+            <div class="agent-grid">
+                {% for team in teams %}
+                    <div class="agent-card">
+                        <div class="agent-title">{{ team.name }}</div>
+                        <div class="agent-meta">{{ team.description or "No description" }}</div>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="muted">No teams yet. Create your first team above.</p>
+        {% endif %}
+    </div>
+
+    <div class="info-panel">
+        <h2>Your agents</h2>
+        {% if agents and agents|length > 0 %}
+            <div class="agent-grid">
+                {% for agent in agents %}
+                    <div class="agent-card">
+                        <div class="agent-title">{{ agent.name }}</div>
+                        <div class="agent-meta">{{ agent.role }} · {{ agent.category }}</div>
+                        <div class="agent-meta">Model: {{ agent.model }}</div>
+                        <div class="agent-meta">Status: {{ agent.status }}</div>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="muted">No agents yet. Create your first agent above.</p>
+        {% endif %}
     </div>
 </section>
 {% endblock %}

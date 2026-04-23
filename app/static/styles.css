@@ -188,6 +188,35 @@ input:focus {
     border-radius: 16px;
 }
 
+.agent-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+}
+
+.agent-card {
+    background: #ffffff;
+    border-radius: 14px;
+    padding: 14px;
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+}
+
+.agent-title {
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.agent-meta {
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin-bottom: 4px;
+}
+
+.muted {
+    color: var(--muted);
+}
+
 .info-panel h2 {
     margin: 0 0 10px;
     font-size: 1.1rem;

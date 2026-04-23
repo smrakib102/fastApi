@@ -13,6 +13,8 @@ class Agent(Base):
     role = Column(String(120), nullable=False)
     model = Column(String(120), nullable=False)
     tools = Column(Text, nullable=False, default="[]")
+    category = Column(String(80), nullable=False, default="general")
+    status = Column(String(32), nullable=False, default="active")
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
