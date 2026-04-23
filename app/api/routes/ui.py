@@ -38,16 +38,7 @@ def root(request: Request, current_user: User | None = Depends(get_current_user)
 def dashboard(request: Request, current_user: User | None = Depends(get_current_user)):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
-
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
-            "user": current_user,
-            "agents": [],
-            "teams": [],
-        },
-    )
+    return RedirectResponse("/dashboard/agents", status_code=303)
 
 
 @router.get("/dashboard/agents", response_class=HTMLResponse)
