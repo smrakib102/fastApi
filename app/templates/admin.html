@@ -11,7 +11,7 @@
         <form class="form-stack" method="post" action="/admin/panel/settings">
             <label>
                 <span>Telegram bot token</span>
-                <input type="text" name="telegram_bot_token" value="{{ settings.get('telegram_bot_token', '') }}" />
+                <input type="text" name="telegram_bot_token" placeholder="{{ masked_settings.get('telegram_bot_token', 'not set') }}" />
             </label>
             <label>
                 <span>Telegram bot username</span>
@@ -19,11 +19,11 @@
             </label>
             <label>
                 <span>OpenAI API key</span>
-                <input type="text" name="openai_api_key" value="{{ settings.get('openai_api_key', '') }}" />
+                <input type="text" name="openai_api_key" placeholder="{{ masked_settings.get('openai_api_key', 'not set') }}" />
             </label>
             <label>
                 <span>Gemini API key</span>
-                <input type="text" name="gemini_api_key" value="{{ settings.get('gemini_api_key', '') }}" />
+                <input type="text" name="gemini_api_key" placeholder="{{ masked_settings.get('gemini_api_key', 'not set') }}" />
             </label>
             <label>
                 <span>Default model provider</span>
@@ -74,6 +74,39 @@
             </div>
         {% else %}
             <p class="muted">No limits set yet.</p>
+        {% endif %}
+    </div>
+
+    <div class="info-panel">
+        <h2>User Management</h2>
+        {% if users and users|length > 0 %}
+            <div class="agent-grid">
+                {% for u in users %}
+                    <div class="agent-card">
+                        <div class="agent-title">{{ u.email }} (ID {{ u.id }})</div>
+                        <div class="agent-meta">Active: {{ "yes" if u.is_active else "no" }}</div>
+                        <div class="agent-meta">Locked: {{ "yes" if u.is_locked else "no" }}</div>
+                        <form class="form-stack" method="post" action="/admin/users/lock">
+                            <input type="hidden" name="user_id" value="{{ u.id }}" />
+                            <button class="btn" type="submit">Lock</button>
+                        </form>
+                        <form class="form-stack" method="post" action="/admin/users/unlock">
+                            <input type="hidden" name="user_id" value="{{ u.id }}" />
+                            <button class="btn" type="submit">Unlock</button>
+                        </form>
+                        <form class="form-stack" method="post" action="/admin/users/reset-password">
+                            <input type="hidden" name="user_id" value="{{ u.id }}" />
+                            <label>
+                                <span>New password</span>
+                                <input type="text" name="new_password" required />
+                            </label>
+                            <button class="btn" type="submit">Reset password</button>
+                        </form>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="muted">No users found.</p>
         {% endif %}
     </div>
 </section>

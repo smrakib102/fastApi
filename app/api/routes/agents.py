@@ -2,14 +2,17 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_user
 from app.core.ai_keys import get_code_provider, get_default_provider
 from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
+from app.models.agent_run import AgentRun
+from app.models.agent_run_step import AgentRunStep
 from app.models.user import User
+from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
 
 router = APIRouter()
 
@@ -20,6 +23,21 @@ class AgentCreate(BaseModel):
     model: str
     tools: list[str] = []
     category: str = "general"
+
+
+class AgentRunRequest(BaseModel):
+    input_text: str | None = None
+
+
+class AgentRunUpdate(BaseModel):
+    status: str | None = None
+    output_text: str | None = None
+
+
+class AgentRunStepCreate(BaseModel):
+    kind: str | None = None
+    status: str | None = None
+    content: str | None = None
 
 
 @router.get("")
@@ -103,3 +121,202 @@ def create_agent(
         if agent.model == "auto"
         else None,
     }
+
+
+@router.post("/{agent_id}/run")
+def run_agent(
+    agent_id: int,
+    payload: AgentRunRequest,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    agent = db.execute(
+        select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
+    ).scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    try:
+        run = execute_agent_run(
+            db,
+            agent,
+            current_user.id,
+            payload.input_text,
+            source="api",
+        )
+    except AgentRuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"run_id": run.id, "status": run.status, "output": run.output_text}
+
+
+@router.get("/{agent_id}/runs")
+def list_agent_runs(
+    agent_id: int,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    runs = db.execute(
+        select(AgentRun)
+        .where(AgentRun.agent_id == agent_id, AgentRun.user_id == current_user.id)
+        .order_by(AgentRun.created_at.desc())
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": run.id,
+                "status": run.status,
+                "input_text": run.input_text,
+                "output_text": run.output_text,
+                "created_at": run.created_at,
+            }
+            for run in runs
+        ]
+    }
+
+
+@router.get("/{agent_id}/runs/{run_id}")
+def get_agent_run(
+    agent_id: int,
+    run_id: int,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    run = db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    step_count = db.execute(
+        select(func.count(AgentRunStep.id)).where(AgentRunStep.run_id == run.id)
+    ).scalar() or 0
+
+    return {
+        "id": run.id,
+        "status": run.status,
+        "input_text": run.input_text,
+        "output_text": run.output_text,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "steps": step_count,
+    }
+
+
+@router.get("/{agent_id}/runs/{run_id}/steps")
+def list_agent_run_steps(
+    agent_id: int,
+    run_id: int,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    run = db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    steps = db.execute(
+        select(AgentRunStep)
+        .where(AgentRunStep.run_id == run.id)
+        .order_by(AgentRunStep.step_index.asc())
+    ).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": step.id,
+                "step_index": step.step_index,
+                "kind": step.kind,
+                "status": step.status,
+                "content": step.content,
+                "created_at": step.created_at,
+                "updated_at": step.updated_at,
+            }
+            for step in steps
+        ]
+    }
+
+
+@router.post("/{agent_id}/runs/{run_id}/steps")
+def add_agent_run_step(
+    agent_id: int,
+    run_id: int,
+    payload: AgentRunStepCreate,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    run = db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    next_index = (
+        db.execute(
+            select(func.coalesce(func.max(AgentRunStep.step_index), 0)).where(
+                AgentRunStep.run_id == run.id
+            )
+        ).scalar()
+        or 0
+    )
+    step = AgentRunStep(
+        run_id=run.id,
+        step_index=next_index + 1,
+        kind=payload.kind or "note",
+        status=payload.status or "completed",
+        content=payload.content,
+    )
+    db.add(step)
+    db.commit()
+    db.refresh(step)
+
+    return {
+        "id": step.id,
+        "step_index": step.step_index,
+        "kind": step.kind,
+        "status": step.status,
+        "content": step.content,
+    }
+
+
+@router.post("/{agent_id}/runs/{run_id}/update")
+def update_agent_run(
+    agent_id: int,
+    run_id: int,
+    payload: AgentRunUpdate,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    run = db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if payload.status:
+        run.status = payload.status
+    if payload.output_text is not None:
+        run.output_text = payload.output_text
+
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    return {"id": run.id, "status": run.status, "output_text": run.output_text}

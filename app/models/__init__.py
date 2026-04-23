@@ -1,12 +1,18 @@
 from app.models.admin_setting import AdminSetting
+from app.models.audit_log import AuditLog
 from app.models.agent import Agent
+from app.models.agent_run import AgentRun
+from app.models.agent_run_step import AgentRunStep
 from app.models.agent_relation import AgentRelation
+from app.models.agent_template import AgentTemplate
 from app.models.approval import Approval
 from app.models.employee import Employee
 from app.models.google_account import GoogleAccount
 from app.models.reminder import Reminder
 from app.models.task import Task
 from app.models.telegram_link import TelegramLink
+from app.models.telegram_message import TelegramMessage
+from app.models.summary_schedule import SummarySchedule
 from app.models.team import Team
 from app.models.team_agent import TeamAgent
 from app.models.tool_credential import ToolCredential
@@ -22,11 +28,16 @@ __all__ = [
 	"Approval",
 	"AdminSetting",
 	"AgentRelation",
+	"AgentTemplate",
+	"AgentRun",
+	"AgentRunStep",
 	"Employee",
 	"GoogleAccount",
 	"Reminder",
 	"Task",
 	"TelegramLink",
+	"TelegramMessage",
+	"SummarySchedule",
 	"Team",
 	"TeamAgent",
 	"ToolCredential",
@@ -36,4 +47,5 @@ __all__ = [
 	"UserLimit",
 	"UserProfile",
 	"UsageLog",
+	"AuditLog",
 ]

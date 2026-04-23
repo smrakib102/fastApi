@@ -37,7 +37,9 @@ def approve(approval_id: int, payload: ApprovalResolution, db: Session = Depends
         if not draft_id:
             raise HTTPException(status_code=400, detail="Missing draft_id")
 
-        account = _ensure_token(db, _get_default_account(db))
+        if not approval.user_id:
+            raise HTTPException(status_code=400, detail="Approval missing user")
+        account = _ensure_token(db, _get_default_account(db, approval.user_id))
         headers = {"Authorization": f"Bearer {account.access_token}"}
         response = httpx.post(
             GMAIL_SEND_URL, headers=headers, json={"id": draft_id}, timeout=30
@@ -51,7 +53,9 @@ def approve(approval_id: int, payload: ApprovalResolution, db: Session = Depends
         if not calendar_id:
             raise HTTPException(status_code=400, detail="Missing calendar_id")
 
-        account = _ensure_token(db, _get_default_account(db))
+        if not approval.user_id:
+            raise HTTPException(status_code=400, detail="Approval missing user")
+        account = _ensure_token(db, _get_default_account(db, approval.user_id))
         headers = {"Authorization": f"Bearer {account.access_token}"}
 
         body = {

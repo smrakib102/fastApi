@@ -1,5 +1,6 @@
 import json
 import secrets
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -10,12 +11,18 @@ from app.api.deps import get_db, get_legacy_user, require_user
 from app.core.config import settings
 from app.core.redis_client import get_redis
 from app.models.employee import Employee
+from app.core.crypto import decrypt_value, encrypt_value
 from app.models.admin_setting import AdminSetting
 from app.models.telegram_link import TelegramLink
 from app.models.tool_request import ToolRequest
 from app.models.tool_registry import ToolRegistry
 from app.models.tool_credential import ToolCredential
 from app.models.user import User
+from app.models.telegram_message import TelegramMessage
+from app.models.agent_template import AgentTemplate
+from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
+from app.models.agent import Agent
+from app.services.audit_log import record_audit
 
 router = APIRouter()
 
@@ -59,6 +66,27 @@ def _extract_setkey(text: str | None) -> tuple[str, str] | None:
     return parts[1].strip(), parts[2].strip()
 
 
+def _extract_run(text: str | None) -> tuple[str, str | None] | None:
+    if not text:
+        return None
+    if not text.startswith("/run "):
+        return None
+    parts = text.split(" ", 2)
+    if len(parts) < 2:
+        return None
+    agent_ref = parts[1].strip()
+    prompt = parts[2].strip() if len(parts) > 2 else None
+    return agent_ref, prompt
+
+
+def _is_summary_now(text: str | None) -> bool:
+    return bool(text and text.strip() == "/summary_now")
+
+
+def _is_new_agent(text: str | None) -> bool:
+    return bool(text and text.strip() == "/newagent")
+
+
 def _get_bot_username(db: Session) -> str | None:
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_username")
@@ -70,7 +98,7 @@ def _get_bot_token(db: Session) -> str | None:
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_token")
     ).scalar_one_or_none()
-    return setting.value if setting and setting.value else settings.telegram_bot_token
+    return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
 
 
 def _send_message(db: Session, chat_id: str, text: str, reply_markup: dict | None = None) -> None:
@@ -95,6 +123,26 @@ def _answer_callback(db: Session, callback_id: str, text: str) -> None:
         f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
         json={"callback_query_id": callback_id, "text": text},
         timeout=20,
+    )
+
+
+def _send_tool_request(db: Session, chat_id: str, request_id: int, tool_name: str) -> None:
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "Connect OAuth", "callback_data": f"toolreq:oauth:{request_id}"},
+                {"text": "Add API key", "callback_data": f"toolreq:apikey:{request_id}"},
+            ],
+            [
+                {"text": "Skip", "callback_data": f"toolreq:skip:{request_id}"},
+            ],
+        ]
+    }
+    _send_message(
+        db,
+        chat_id,
+        f"<b>Tool access needed</b>\nTool: <code>{tool_name}</code>\n\nChoose one option below:",
+        reply_markup=keyboard,
     )
 
 
@@ -227,6 +275,9 @@ def telegram_webhook(
     text = message.get("text")
     start_token = _extract_start_token(text)
     setkey = _extract_setkey(text)
+    run_request = _extract_run(text)
+    summary_now = _is_summary_now(text)
+    new_agent = _is_new_agent(text)
 
     linked_user_id: int | None = None
     if start_token:
@@ -284,7 +335,15 @@ def telegram_webhook(
                 select(ToolRegistry).where(ToolRegistry.name == tool_name)
             ).scalar_one_or_none()
             if tool:
-                db.add(ToolCredential(user_id=user_id, tool_id=tool.id, secret=api_key))
+                db.add(ToolCredential(user_id=user_id, tool_id=tool.id, secret=encrypt_value(api_key)))
+                record_audit(
+                    db,
+                    user_id,
+                    "set_tool_key",
+                    "tool_credential",
+                    str(tool.id),
+                    {"tool_name": tool.name, "source": "telegram"},
+                )
                 req = db.execute(
                     select(ToolRequest)
                     .where(ToolRequest.user_id == user_id, ToolRequest.tool_name == tool_name)
@@ -309,7 +368,15 @@ def telegram_webhook(
             select(ToolRegistry).where(ToolRegistry.name == tool_name)
         ).scalar_one_or_none()
         if tool:
-            db.add(ToolCredential(user_id=user_id, tool_id=tool.id, secret=api_key))
+            db.add(ToolCredential(user_id=user_id, tool_id=tool.id, secret=encrypt_value(api_key)))
+            record_audit(
+                db,
+                user_id,
+                "set_tool_key",
+                "tool_credential",
+                str(tool.id),
+                {"tool_name": tool.name, "source": "telegram"},
+            )
             req = db.execute(
                 select(ToolRequest)
                 .where(ToolRequest.user_id == user_id, ToolRequest.tool_name == tool_name)
@@ -325,4 +392,270 @@ def telegram_webhook(
                 f"Saved key for <code>{tool_name}</code>. You can continue now.",
             )
 
+    chat_type = chat.get("type") or "unknown"
+    sender = message.get("from") or {}
+    sent_at = None
+    if message.get("date"):
+        sent_at = datetime.fromtimestamp(message.get("date"), tz=timezone.utc)
+
+    db.add(
+        TelegramMessage(
+            user_id=linked_user_id or (existing.user_id if existing else legacy_user.id),
+            chat_id=str(chat_id),
+            chat_type=chat_type,
+            message_id=str(message.get("message_id") or ""),
+            sender_id=str(sender.get("id")) if sender.get("id") else None,
+            sender_name=_build_display_name(message),
+            text=text,
+            sent_at=sent_at,
+            raw_json=json.dumps(message, ensure_ascii=True),
+        )
+    )
+    db.commit()
+
+    if run_request:
+        agent_ref, prompt = run_request
+        user_id = linked_user_id or (existing.user_id if existing else legacy_user.id)
+        agent = None
+        if agent_ref.isdigit():
+            agent = db.execute(
+                select(Agent).where(Agent.id == int(agent_ref), Agent.user_id == user_id)
+            ).scalar_one_or_none()
+        if not agent:
+            agent = db.execute(
+                select(Agent).where(Agent.name == agent_ref, Agent.user_id == user_id)
+            ).scalar_one_or_none()
+
+        if not agent:
+            _send_message(db, chat_id, f"Agent not found: <code>{agent_ref}</code>")
+            return {"ok": True}
+
+        try:
+            run = execute_agent_run(db, agent, user_id, prompt, source="telegram")
+        except AgentRuntimeError as exc:
+            _send_message(db, chat_id, f"Run failed: {exc}")
+            return {"ok": True}
+
+        _send_message(db, chat_id, run.output_text or "(no output)")
+        return {"ok": True}
+
+    if summary_now:
+        try:
+            from app.services.summary_service import generate_summary
+
+            summary = generate_summary(
+                db,
+                linked_user_id or (existing.user_id if existing else legacy_user.id),
+                str(chat_id),
+                "UTC",
+            )
+            _send_message(db, chat_id, summary)
+        except Exception as exc:
+            _send_message(db, chat_id, f"Summary failed: {exc}")
+        return {"ok": True}
+
+    if new_agent:
+        templates = db.execute(select(AgentTemplate)).scalars().all()
+        if not templates:
+            _send_message(db, chat_id, "No templates available yet.")
+            return {"ok": True}
+
+        template_list = "\n".join(
+            [f"{template.id}. {template.name}" for template in templates]
+        )
+        get_redis().setex(
+            f"telegram:template:{chat_id}",
+            settings.telegram_prompt_ttl_seconds,
+            json.dumps({"stage": "choose"}),
+        )
+        _send_message(db, chat_id, f"Choose a template by ID:\n{template_list}")
+        return {"ok": True}
+
+    pending_template_raw = get_redis().get(f"telegram:template:{chat_id}")
+    if pending_template_raw and text and not text.startswith("/"):
+        pending = json.loads(pending_template_raw)
+        stage = pending.get("stage")
+        user_id = linked_user_id or (existing.user_id if existing else legacy_user.id)
+
+        if stage == "choose":
+            template = None
+            if text.isdigit():
+                template = db.execute(
+                    select(AgentTemplate).where(AgentTemplate.id == int(text))
+                ).scalar_one_or_none()
+            if not template:
+                template = db.execute(
+                    select(AgentTemplate).where(AgentTemplate.name == text)
+                ).scalar_one_or_none()
+            if not template:
+                _send_message(db, chat_id, "Template not found. Reply with a valid ID.")
+                return {"ok": True}
+
+            fields = json.loads(template.fields or "[]")
+            pending = {
+                "stage": "fields",
+                "template_id": template.id,
+                "fields": fields,
+                "index": 0,
+                "values": {},
+            }
+            get_redis().setex(
+                f"telegram:template:{chat_id}",
+                settings.telegram_prompt_ttl_seconds,
+                json.dumps(pending),
+            )
+            if fields:
+                _send_message(db, chat_id, f"{fields[0].get('label') or fields[0].get('key')}")
+            else:
+                agent = Agent(
+                    user_id=user_id,
+                    name=f"{template.name} Agent",
+                    role=template.description or template.name,
+                    model=template.model,
+                    tools=template.tools,
+                    category=template.category,
+                    status="active",
+                    template_id=template.id,
+                    config=json.dumps({}, ensure_ascii=True),
+                )
+                db.add(agent)
+                db.commit()
+                db.refresh(agent)
+                required_tools = json.loads(template.tools or "[]")
+                for tool_name in required_tools:
+                    tool = db.execute(
+                        select(ToolRegistry).where(ToolRegistry.name == tool_name)
+                    ).scalar_one_or_none()
+                    if not tool:
+                        request = ToolRequest(user_id=user_id, tool_name=tool_name)
+                        db.add(request)
+                        db.commit()
+                        db.refresh(request)
+                        _send_tool_request(db, chat_id, request.id, tool_name)
+                        continue
+                    credential = db.execute(
+                        select(ToolCredential)
+                        .where(ToolCredential.user_id == user_id, ToolCredential.tool_id == tool.id)
+                    ).scalar_one_or_none()
+                    if not credential:
+                        request = ToolRequest(user_id=user_id, tool_name=tool_name)
+                        db.add(request)
+                        db.commit()
+                        db.refresh(request)
+                        _send_tool_request(db, chat_id, request.id, tool_name)
+                db.commit()
+                get_redis().delete(f"telegram:template:{chat_id}")
+                _send_message(db, chat_id, f"Created agent <code>{agent.name}</code>.")
+            return {"ok": True}
+
+        if stage == "fields":
+            fields = pending.get("fields") or []
+            index = int(pending.get("index") or 0)
+            values = pending.get("values") or {}
+            if index < len(fields):
+                key = fields[index].get("key")
+                if key:
+                    values[key] = text.strip()
+            index += 1
+
+            if index < len(fields):
+                pending.update({"index": index, "values": values})
+                get_redis().setex(
+                    f"telegram:template:{chat_id}",
+                    settings.telegram_prompt_ttl_seconds,
+                    json.dumps(pending),
+                )
+                next_label = fields[index].get("label") or fields[index].get("key")
+                _send_message(db, chat_id, next_label)
+                return {"ok": True}
+
+            template = db.execute(
+                select(AgentTemplate).where(AgentTemplate.id == pending.get("template_id"))
+            ).scalar_one_or_none()
+            if not template:
+                _send_message(db, chat_id, "Template not found.")
+                return {"ok": True}
+
+            agent_name = values.get("agent_name") or f"{template.name} Agent"
+            agent = Agent(
+                user_id=user_id,
+                name=agent_name,
+                role=template.description or template.name,
+                model=template.model,
+                tools=template.tools,
+                category=template.category,
+                status="active",
+                template_id=template.id,
+                config=json.dumps(values, ensure_ascii=True),
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            required_tools = json.loads(template.tools or "[]")
+            for tool_name in required_tools:
+                tool = db.execute(
+                    select(ToolRegistry).where(ToolRegistry.name == tool_name)
+                ).scalar_one_or_none()
+                if not tool:
+                    request = ToolRequest(user_id=user_id, tool_name=tool_name)
+                    db.add(request)
+                    db.commit()
+                    db.refresh(request)
+                    _send_tool_request(db, chat_id, request.id, tool_name)
+                    continue
+                credential = db.execute(
+                    select(ToolCredential)
+                    .where(ToolCredential.user_id == user_id, ToolCredential.tool_id == tool.id)
+                ).scalar_one_or_none()
+                if not credential:
+                    request = ToolRequest(user_id=user_id, tool_name=tool_name)
+                    db.add(request)
+                    db.commit()
+                    db.refresh(request)
+                    _send_tool_request(db, chat_id, request.id, tool_name)
+
+            db.commit()
+            get_redis().delete(f"telegram:template:{chat_id}")
+            _send_message(db, chat_id, f"Created agent <code>{agent.name}</code>.")
+            return {"ok": True}
+
     return {"ok": True}
+
+
+@router.get("/messages")
+def list_messages(
+    chat_id: str,
+    date: str,
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid date format") from exc
+
+    next_day = day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    messages = db.execute(
+        select(TelegramMessage)
+        .where(
+            TelegramMessage.user_id == current_user.id,
+            TelegramMessage.chat_id == chat_id,
+            TelegramMessage.sent_at >= day,
+            TelegramMessage.sent_at < next_day,
+        )
+        .order_by(TelegramMessage.sent_at.asc())
+    ).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": msg.id,
+                "chat_id": msg.chat_id,
+                "sender_name": msg.sender_name,
+                "text": msg.text,
+                "sent_at": msg.sent_at,
+            }
+            for msg in messages
+        ]
+    }

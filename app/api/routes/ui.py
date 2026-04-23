@@ -10,12 +10,16 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.ai_keys import get_code_provider, get_default_provider
+from app.core.crypto import encrypt_value
 from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
+from app.models.agent_run import AgentRun
 from app.models.team_agent import TeamAgent
 from app.models.user_profile import UserProfile
 from app.models.team import Team
 from app.models.user import User
+from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
+from app.services.audit_log import record_audit
 
 router = APIRouter()
 
@@ -85,6 +89,16 @@ def dashboard_agents(
     ).scalars().all()
     key_map = {item.key: item.value for item in keys}
 
+    latest_runs = db.execute(
+        select(AgentRun)
+        .where(AgentRun.user_id == current_user.id)
+        .order_by(AgentRun.created_at.desc())
+    ).scalars().all()
+    run_map: dict[int, AgentRun] = {}
+    for run in latest_runs:
+        if run.agent_id not in run_map:
+            run_map[run.agent_id] = run
+
     default_provider = get_default_provider(db)
     code_provider = get_code_provider(db)
     for agent in agents:
@@ -109,6 +123,7 @@ def dashboard_agents(
             "teams": teams,
             "team_agents": team_map,
             "key_map": key_map,
+            "run_map": run_map,
         },
     )
 
@@ -213,18 +228,46 @@ def dashboard_update_keys(
         return RedirectResponse("/auth/login", status_code=303)
 
     def upsert(key: str, value: str):
+        stored = encrypt_value(value)
         existing = db.execute(
             select(UserProfile).where(UserProfile.user_id == current_user.id, UserProfile.key == key)
         ).scalar_one_or_none()
         if existing:
-            existing.value = value
+            existing.value = stored
         else:
-            db.add(UserProfile(user_id=current_user.id, key=key, value=value))
+            db.add(UserProfile(user_id=current_user.id, key=key, value=stored))
 
     if openai_api_key:
         upsert("openai_api_key", openai_api_key)
+        record_audit(db, current_user.id, "update_key", "user_profile", "openai_api_key")
     if gemini_api_key:
         upsert("gemini_api_key", gemini_api_key)
+        record_audit(db, current_user.id, "update_key", "user_profile", "gemini_api_key")
 
     db.commit()
+    return RedirectResponse("/dashboard/agents", status_code=303)
+
+
+@router.post("/dashboard/agents/run")
+def dashboard_run_agent(
+    request: Request,
+    agent_id: int = Form(...),
+    input_text: str = Form(""),
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    agent = db.execute(
+        select(Agent).where(Agent.id == agent_id, Agent.user_id == current_user.id)
+    ).scalar_one_or_none()
+    if not agent:
+        return RedirectResponse("/dashboard/agents?error=missing", status_code=303)
+
+    try:
+        execute_agent_run(db, agent, current_user.id, input_text or None, source="ui")
+    except AgentRuntimeError:
+        return RedirectResponse("/dashboard/agents?error=runtime", status_code=303)
+
     return RedirectResponse("/dashboard/agents", status_code=303)

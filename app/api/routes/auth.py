@@ -41,6 +41,12 @@ def login_submit(
             {"request": request, "error": "Invalid email or password."},
             status_code=400,
         )
+    if not user.is_active or user.is_locked:
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Account is locked."},
+            status_code=403,
+        )
 
     if not verify_password(password, user.hashed_password):
         return templates.TemplateResponse(

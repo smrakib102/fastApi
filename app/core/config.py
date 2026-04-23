@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     auth_cookie_name: str = "aiagent_session"
     auth_token_issuer: str = "ai-agent-system"
     legacy_user_email: str = "legacy@local"
+    secrets_master_key: str | None = None
 
     class Config:
         env_file = ".env"

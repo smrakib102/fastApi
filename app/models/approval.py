@@ -9,6 +9,7 @@ class Approval(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     type = Column(String(64), nullable=False)
     payload = Column(Text, nullable=False)
     status = Column(String(32), nullable=False, default="pending")

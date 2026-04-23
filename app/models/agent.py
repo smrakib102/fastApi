@@ -14,6 +14,8 @@ class Agent(Base):
     model = Column(String(120), nullable=False)
     tools = Column(Text, nullable=False, default="[]")
     category = Column(String(80), nullable=False, default="general")
+    template_id = Column(Integer, ForeignKey("agent_templates.id"), nullable=True)
+    config = Column(Text, nullable=True)
     status = Column(String(32), nullable=False, default="active")
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

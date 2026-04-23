@@ -25,7 +25,7 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
 
 
 def require_admin_user(current_user: User | None = Depends(get_current_user)) -> User:
-    if not current_user or not current_user.is_admin:
+    if not current_user or not current_user.is_admin or not current_user.is_active or current_user.is_locked:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
@@ -76,7 +76,7 @@ def get_current_user(
 
 
 def require_user(current_user: User | None = Depends(get_current_user)) -> User:
-    if not current_user:
+    if not current_user or not current_user.is_active or current_user.is_locked:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return current_user
 

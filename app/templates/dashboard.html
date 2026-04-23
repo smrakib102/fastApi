@@ -134,6 +134,19 @@
                             <div class="agent-meta">Provider: {{ agent.resolved_provider or "unavailable" }}</div>
                         {% endif %}
                         <div class="agent-meta">Status: {{ agent.status }}</div>
+                        {% if run_map and run_map.get(agent.id) %}
+                            <div class="agent-meta">
+                                Latest output: {{ run_map.get(agent.id).output_text or "(no output yet)" }}
+                            </div>
+                        {% endif %}
+                        <form class="form-stack" method="post" action="/dashboard/agents/run">
+                            <input type="hidden" name="agent_id" value="{{ agent.id }}" />
+                            <label>
+                                <span>Run input</span>
+                                <input type="text" name="input_text" placeholder="Ask this agent something" />
+                            </label>
+                            <button class="btn" type="submit">Run agent</button>
+                        </form>
                     </div>
                 {% endfor %}
             </div>

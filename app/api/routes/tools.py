@@ -7,11 +7,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_legacy_user
+from app.api.deps import get_db
 from app.api.routes.google_oauth import _ensure_token, _get_default_account
 from app.core.config import settings
 from app.models.approval import Approval
 from app.services.usage_limits import check_and_record_usage
+from app.services.audit_log import record_audit
 
 router = APIRouter()
 
@@ -41,7 +42,7 @@ def _build_raw_message(to: str, subject: str, body: str) -> str:
     return base64.urlsafe_b64encode(raw_bytes).decode("utf-8")
 
 
-def _gmail_draft(args: dict, db: Session) -> dict:
+def _gmail_draft(args: dict, db: Session, user_id: int) -> dict:
     to = args.get("to")
     subject = args.get("subject")
     body = args.get("body")
@@ -50,7 +51,7 @@ def _gmail_draft(args: dict, db: Session) -> dict:
     if not to or not subject or not body:
         raise HTTPException(status_code=400, detail="Missing to/subject/body")
 
-    account = _ensure_token(db, _get_default_account(db))
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
 
     payload: dict = {"message": {"raw": _build_raw_message(to, subject, body)}}
@@ -64,15 +65,15 @@ def _gmail_draft(args: dict, db: Session) -> dict:
     return response.json()
 
 
-def _gmail_send_request(args: dict, db: Session) -> dict:
+def _gmail_send_request(args: dict, db: Session, user_id: int, agent_id: int | None) -> dict:
     draft_id = args.get("draft_id")
     reason = args.get("reason")
     if not draft_id:
         raise HTTPException(status_code=400, detail="Missing draft_id")
 
-    legacy_user = get_legacy_user(db)
     approval = Approval(
-        user_id=legacy_user.id,
+        user_id=user_id,
+        agent_id=agent_id,
         type="gmail.send",
         payload=json.dumps({"draft_id": draft_id, "reason": reason}),
     )
@@ -83,12 +84,12 @@ def _gmail_send_request(args: dict, db: Session) -> dict:
     return {"approval_id": approval.id, "status": approval.status}
 
 
-def _gmail_send(args: dict, db: Session) -> dict:
+def _gmail_send(args: dict, db: Session, user_id: int) -> dict:
     draft_id = args.get("draft_id")
     if not draft_id:
         raise HTTPException(status_code=400, detail="Missing draft_id")
 
-    account = _ensure_token(db, _get_default_account(db))
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     response = httpx.post(GMAIL_SEND_URL, headers=headers, json={"id": draft_id}, timeout=30)
     if response.status_code != 200:
@@ -97,8 +98,8 @@ def _gmail_send(args: dict, db: Session) -> dict:
     return response.json()
 
 
-def _gmail_profile(db: Session) -> dict:
-    account = _ensure_token(db, _get_default_account(db))
+def _gmail_profile(db: Session, user_id: int) -> dict:
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     response = httpx.get(GMAIL_PROFILE_URL, headers=headers, timeout=30)
     if response.status_code != 200:
@@ -106,8 +107,8 @@ def _gmail_profile(db: Session) -> dict:
     return response.json()
 
 
-def _calendar_list(db: Session) -> dict:
-    account = _ensure_token(db, _get_default_account(db))
+def _calendar_list(db: Session, user_id: int) -> dict:
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     response = httpx.get(CALENDAR_LIST_URL, headers=headers, timeout=30)
     if response.status_code != 200:
@@ -115,10 +116,10 @@ def _calendar_list(db: Session) -> dict:
     return response.json()
 
 
-def _gmail_list_messages(args: dict, db: Session) -> dict:
+def _gmail_list_messages(args: dict, db: Session, user_id: int) -> dict:
     max_results = args.get("max_results", 10)
     query = args.get("q")
-    account = _ensure_token(db, _get_default_account(db))
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     params: dict = {"maxResults": max_results}
     if query:
@@ -169,9 +170,9 @@ def _gmail_list_messages(args: dict, db: Session) -> dict:
     }
 
 
-def _gmail_list_drafts(args: dict, db: Session) -> dict:
+def _gmail_list_drafts(args: dict, db: Session, user_id: int) -> dict:
     max_results = args.get("max_results", 10)
-    account = _ensure_token(db, _get_default_account(db))
+    account = _ensure_token(db, _get_default_account(db, user_id))
     headers = {"Authorization": f"Bearer {account.access_token}"}
     params = {"maxResults": max_results}
     response = httpx.get(GMAIL_DRAFT_URL, headers=headers, params=params, timeout=30)
@@ -180,7 +181,7 @@ def _gmail_list_drafts(args: dict, db: Session) -> dict:
     return response.json()
 
 
-def _calendar_create_request(args: dict, db: Session) -> dict:
+def _calendar_create_request(args: dict, db: Session, user_id: int, agent_id: int | None) -> dict:
     calendar_id = args.get("calendar_id")
     summary = args.get("summary")
     start = args.get("start")
@@ -188,9 +189,9 @@ def _calendar_create_request(args: dict, db: Session) -> dict:
     if not calendar_id or not summary or not start or not end:
         raise HTTPException(status_code=400, detail="Missing calendar fields")
 
-    legacy_user = get_legacy_user(db)
     approval = Approval(
-        user_id=legacy_user.id,
+        user_id=user_id,
+        agent_id=agent_id,
         type="calendar.create",
         payload=json.dumps(
             {
@@ -222,12 +223,14 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
                         "to": {"type": "string"},
                         "subject": {"type": "string"},
                         "body": {"type": "string"},
                         "thread_id": {"type": "string"},
                     },
-                    "required": ["to", "subject", "body"],
+                    "required": ["user_id", "to", "subject", "body"],
                 },
             },
             {
@@ -236,10 +239,12 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
                         "draft_id": {"type": "string"},
                         "reason": {"type": "string"},
                     },
-                    "required": ["draft_id"],
+                    "required": ["user_id", "draft_id"],
                 },
             },
             {
@@ -247,19 +252,31 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "description": "Send a Gmail draft (approval should be enforced upstream).",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"draft_id": {"type": "string"}},
-                    "required": ["draft_id"],
+                    "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
+                        "draft_id": {"type": "string"},
+                    },
+                    "required": ["user_id", "draft_id"],
                 },
             },
             {
                 "name": "gmail.profile",
                 "description": "Fetch Gmail profile data.",
-                "input_schema": {"type": "object", "properties": {}},
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"user_id": {"type": "integer"}, "agent_id": {"type": "integer"}},
+                    "required": ["user_id"],
+                },
             },
             {
                 "name": "calendar.list",
                 "description": "List Google calendars.",
-                "input_schema": {"type": "object", "properties": {}},
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"user_id": {"type": "integer"}, "agent_id": {"type": "integer"}},
+                    "required": ["user_id"],
+                },
             },
             {
                 "name": "calendar.create_request",
@@ -267,6 +284,8 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
                         "calendar_id": {"type": "string"},
                         "summary": {"type": "string"},
                         "description": {"type": "string"},
@@ -274,7 +293,7 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                         "end": {"type": "object"},
                         "attendees": {"type": "array"},
                     },
-                    "required": ["calendar_id", "summary", "start", "end"],
+                    "required": ["user_id", "calendar_id", "summary", "start", "end"],
                 },
             },
             {
@@ -283,9 +302,12 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
                         "max_results": {"type": "integer"},
                         "q": {"type": "string"},
                     },
+                    "required": ["user_id"],
                 },
             },
             {
@@ -293,7 +315,12 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "description": "List Gmail drafts.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"max_results": {"type": "integer"}},
+                    "properties": {
+                        "user_id": {"type": "integer"},
+                        "agent_id": {"type": "integer"},
+                        "max_results": {"type": "integer"},
+                    },
+                    "required": ["user_id"],
                 },
             },
         ]
@@ -319,21 +346,38 @@ def tool_execute(
             int(usage_tokens),
         )
 
+    user_id = payload.arguments.get("user_id")
+    agent_id = payload.arguments.get("agent_id")
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+    user_id = int(user_id)
+    if agent_id is not None:
+        agent_id = int(agent_id)
+
+    record_audit(
+        db,
+        user_id,
+        "tool_execute",
+        "tool",
+        payload.name,
+        {"agent_id": agent_id},
+    )
+
     if payload.name == "gmail.draft":
-        return _gmail_draft(payload.arguments, db)
+        return _gmail_draft(payload.arguments, db, user_id)
     if payload.name == "gmail.send_request":
-        return _gmail_send_request(payload.arguments, db)
+        return _gmail_send_request(payload.arguments, db, user_id, agent_id)
     if payload.name == "gmail.send":
-        return _gmail_send(payload.arguments, db)
+        return _gmail_send(payload.arguments, db, user_id)
     if payload.name == "gmail.profile":
-        return _gmail_profile(db)
+        return _gmail_profile(db, user_id)
     if payload.name == "calendar.list":
-        return _calendar_list(db)
+        return _calendar_list(db, user_id)
     if payload.name == "calendar.create_request":
-        return _calendar_create_request(payload.arguments, db)
+        return _calendar_create_request(payload.arguments, db, user_id, agent_id)
     if payload.name == "gmail.list_messages":
-        return _gmail_list_messages(payload.arguments, db)
+        return _gmail_list_messages(payload.arguments, db, user_id)
     if payload.name == "gmail.list_drafts":
-        return _gmail_list_drafts(payload.arguments, db)
+        return _gmail_list_drafts(payload.arguments, db, user_id)
 
     raise HTTPException(status_code=404, detail="Unknown tool")

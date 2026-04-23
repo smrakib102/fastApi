@@ -8,12 +8,14 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin_user, require_user
 from app.core.config import settings
+from app.core.crypto import decrypt_value, encrypt_value
 from app.models.admin_setting import AdminSetting
 from app.models.telegram_link import TelegramLink
 from app.models.tool_credential import ToolCredential
 from app.models.tool_registry import ToolRegistry
 from app.models.tool_request import ToolRequest
 from app.models.user import User
+from app.services.audit_log import record_audit
 
 router = APIRouter()
 
@@ -22,7 +24,7 @@ def _get_bot_token(db: Session) -> str | None:
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_token")
     ).scalar_one_or_none()
-    return setting.value if setting and setting.value else settings.telegram_bot_token
+    return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
 
 
 def _send_telegram_message(
@@ -185,7 +187,15 @@ def set_tool_key(
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
 
-    db.add(ToolCredential(user_id=current_user.id, tool_id=tool.id, secret=api_key))
+    db.add(ToolCredential(user_id=current_user.id, tool_id=tool.id, secret=encrypt_value(api_key)))
+    record_audit(
+        db,
+        current_user.id,
+        "set_tool_key",
+        "tool_credential",
+        str(tool.id),
+        {"tool_name": tool.name},
+    )
 
     req = db.execute(
         select(ToolRequest)
