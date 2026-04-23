@@ -1,8 +1,11 @@
 services:
   app:
     build: .
+    working_dir: /app
     env_file:
       - .env
+    environment:
+      PYTHONPATH: /app
     ports:
       - "8000:8000"
     depends_on:
