@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     agent_max_steps: int = 8
     agent_timeout_seconds: int = 120
     agent_memory_steps: int = 6
+    agent_task_max_retries: int = 3
+    agent_task_retry_backoff_seconds: int = 15
     auth_secret_key: str = "change-me"
     auth_algorithm: str = "HS256"
     auth_access_token_minutes: int = 60

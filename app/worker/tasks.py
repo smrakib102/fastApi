@@ -4,10 +4,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from app.db.session import SessionLocal
+from app.models.approval import Approval
+from app.services.agent_executor import ToolExecutionError, execute_tool
+from app.services.agent_runtime import execute_agent_run_by_id
 from app.models.summary_schedule import SummarySchedule
 from app.services.summary_service import generate_summary
 from app.services.telegram_service import send_message
 from app.worker.celery_app import celery_app
+from app.core.config import settings
 
 
 @celery_app.task(name="app.worker.tasks.ping")
@@ -44,5 +48,41 @@ def send_summaries():
             except Exception:
                 continue
         db.commit()
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.worker.tasks.run_agent_task", bind=True)
+def run_agent_task(self, run_id: int):
+    db = SessionLocal()
+    try:
+        return execute_agent_run_by_id(db, run_id)
+    except Exception as exc:
+        countdown = settings.agent_task_retry_backoff_seconds * (2 ** self.request.retries)
+        raise self.retry(exc=exc, countdown=countdown, max_retries=settings.agent_task_max_retries)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.worker.tasks.execute_tool_task", bind=True)
+def execute_tool_task(self, tool_name: str, tool_args: dict):
+    db = SessionLocal()
+    try:
+        return execute_tool(db, tool_name, tool_args, retries=1)
+    except ToolExecutionError as exc:
+        countdown = settings.agent_task_retry_backoff_seconds * (2 ** self.request.retries)
+        raise self.retry(exc=exc, countdown=countdown, max_retries=settings.agent_task_max_retries)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.worker.tasks.approval_wait_task")
+def approval_wait_task(approval_id: int):
+    db = SessionLocal()
+    try:
+        approval = db.query(Approval).filter(Approval.id == approval_id).one_or_none()
+        if not approval:
+            return {"status": "missing"}
+        return {"status": approval.status}
     finally:
         db.close()

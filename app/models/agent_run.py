@@ -13,6 +13,9 @@ class AgentRun(Base):
     status = Column(String(32), nullable=False, default="pending")
     input_text = Column(Text, nullable=True)
     output_text = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

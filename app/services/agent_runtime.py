@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -13,6 +14,7 @@ from app.services.agent_executor import ToolExecutionError, execute_tool
 from app.services.agent_memory import get_recent_steps, render_steps_for_prompt
 from app.services.agent_planner import plan_next_action
 from app.services.agent_state import add_step, create_run, finalize_run
+from app.worker.celery_app import celery_app
 
 
 class AgentRuntimeError(RuntimeError):
@@ -52,7 +54,55 @@ def execute_agent_run(
     input_text: str | None,
     source: str,
 ) -> AgentRun:
-    run = create_run(db, agent, user_id, input_text)
+    run = create_run(
+        db,
+        agent,
+        user_id,
+        input_text,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    )
+    return _execute_run_loop(db, run, agent, user_id, input_text, source)
+
+
+def enqueue_agent_run(
+    db: Session,
+    agent: Agent,
+    user_id: int,
+    input_text: str | None,
+    source: str,
+) -> AgentRun:
+    run = create_run(db, agent, user_id, input_text, status="pending", started_at=None)
+    celery_app.send_task("app.worker.tasks.run_agent_task", args=[run.id])
+    return run
+
+
+def execute_agent_run_by_id(db: Session, run_id: int) -> AgentRun:
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
+    if not run:
+        raise AgentRuntimeError("Run not found")
+
+    agent = db.query(Agent).filter(Agent.id == run.agent_id).one_or_none()
+    if not agent:
+        raise AgentRuntimeError("Agent not found")
+
+    run.status = "running"
+    run.started_at = datetime.now(timezone.utc)
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    return _execute_run_loop(db, run, agent, run.user_id, run.input_text, "async")
+
+
+def _execute_run_loop(
+    db: Session,
+    run: AgentRun,
+    agent: Agent,
+    user_id: int,
+    input_text: str | None,
+    source: str,
+) -> AgentRun:
     tools = json.loads(agent.tools or "[]")
     max_steps = settings.agent_max_steps
     timeout_seconds = settings.agent_timeout_seconds
@@ -76,7 +126,7 @@ def execute_agent_run(
                 input_data=tool_args,
                 output_data=result,
             )
-            finalize_run(db, run, "completed", json.dumps(result, ensure_ascii=True))
+            finalize_run(db, run, "completed", json.dumps(result, ensure_ascii=True), None)
             return run
         except ToolExecutionError as exc:
             add_step(
@@ -89,7 +139,7 @@ def execute_agent_run(
                 input_data=tool_args,
                 output_data={"error": str(exc)},
             )
-            finalize_run(db, run, "failed", str(exc))
+            finalize_run(db, run, "failed", str(exc), str(exc))
             return run
 
     step_number = 1
@@ -103,7 +153,7 @@ def execute_agent_run(
                 "failed",
                 output_data={"error": "Run timed out"},
             )
-            finalize_run(db, run, "failed", "Run timed out")
+            finalize_run(db, run, "failed", "Run timed out", "Run timed out")
             return run
 
         recent = get_recent_steps(db, run.id, memory_steps) if memory_steps > 0 else []
@@ -128,7 +178,7 @@ def execute_agent_run(
                 "failed",
                 output_data={"error": str(exc)},
             )
-            finalize_run(db, run, "failed", str(exc))
+            finalize_run(db, run, "failed", str(exc), str(exc))
             return run
 
         if plan.action == "final":
@@ -141,7 +191,7 @@ def execute_agent_run(
                 thought=plan.thought,
                 output_data={"final_answer": plan.final_answer},
             )
-            finalize_run(db, run, "completed", plan.final_answer or "")
+            finalize_run(db, run, "completed", plan.final_answer or "", None)
             logger.info("agent_run_completed", extra={"run_id": run.id, "steps": step_number})
             return run
 
@@ -156,7 +206,7 @@ def execute_agent_run(
                     thought=plan.thought,
                     output_data={"error": "Tool not available"},
                 )
-                finalize_run(db, run, "failed", "Tool not available")
+                finalize_run(db, run, "failed", "Tool not available", "Tool not available")
                 return run
 
             tool_args = plan.tool_input or {}
@@ -192,7 +242,7 @@ def execute_agent_run(
                     input_data=tool_args,
                     output_data={"error": str(exc)},
                 )
-                finalize_run(db, run, "failed", str(exc))
+                finalize_run(db, run, "failed", str(exc), str(exc))
                 return run
 
         step_number += 1
@@ -205,5 +255,5 @@ def execute_agent_run(
         "failed",
         output_data={"error": "Max steps reached"},
     )
-    finalize_run(db, run, "failed", "Max steps reached")
+    finalize_run(db, run, "failed", "Max steps reached", "Max steps reached")
     return run

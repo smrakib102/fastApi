@@ -12,6 +12,7 @@ from app.api.routes import (
 	gmail,
 	google_oauth,
 	health,
+	metrics,
 	summaries,
 	telegram,
 	templates,
@@ -29,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 app.include_router(health.router, tags=["health"])
+app.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
 app.include_router(ui.router, tags=["ui"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])

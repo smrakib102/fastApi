@@ -27,6 +27,8 @@ class AgentCreate(BaseModel):
 
 class AgentRunRequest(BaseModel):
     input_text: str | None = None
+    async_mode: bool | None = None
+from app.services.agent_runtime import AgentRuntimeError, enqueue_agent_run, execute_agent_run
 
 
 class AgentRunUpdate(BaseModel):
@@ -137,13 +139,22 @@ def run_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     try:
-        run = execute_agent_run(
-            db,
-            agent,
-            current_user.id,
-            payload.input_text,
-            source="api",
-        )
+        if payload.async_mode:
+            run = enqueue_agent_run(
+                db,
+                agent,
+                current_user.id,
+                payload.input_text,
+                source="api",
+            )
+        else:
+            run = execute_agent_run(
+                db,
+                agent,
+                current_user.id,
+                payload.input_text,
+                source="api",
+            )
     except AgentRuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
