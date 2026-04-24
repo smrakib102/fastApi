@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     admin_otp_ttl_seconds: int = 600
     admin_otp_rate_seconds: int = 60
     admin_otp_max_attempts: int = 5
+    agent_max_steps: int = 8
+    agent_timeout_seconds: int = 120
+    agent_memory_steps: int = 6
     auth_secret_key: str = "change-me"
     auth_algorithm: str = "HS256"
     auth_access_token_minutes: int = 60

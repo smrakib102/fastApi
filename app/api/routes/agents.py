@@ -230,20 +230,43 @@ def list_agent_run_steps(
         .order_by(AgentRunStep.step_index.asc())
     ).scalars().all()
 
-    return {
-        "items": [
+    items = []
+    for step in steps:
+        content = {}
+        if step.content:
+            try:
+                content = json.loads(step.content)
+            except json.JSONDecodeError:
+                content = {}
+        input_value = _parse_json_field(step.input_json) or content.get("input")
+        output_value = _parse_json_field(step.output_json) or content.get("output")
+        items.append(
             {
                 "id": step.id,
                 "step_index": step.step_index,
+                "step_number": step.step_number or step.step_index,
                 "kind": step.kind,
+                "action_type": step.action_type or content.get("action_type"),
+                "thought": step.thought or content.get("thought"),
+                "tool_name": step.tool_name or content.get("tool_name"),
+                "input": input_value,
+                "output": output_value,
                 "status": step.status,
                 "content": step.content,
                 "created_at": step.created_at,
                 "updated_at": step.updated_at,
             }
-            for step in steps
-        ]
-    }
+        )
+    return {"items": items}
+
+
+def _parse_json_field(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 @router.post("/{agent_id}/runs/{run_id}/steps")
