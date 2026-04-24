@@ -38,6 +38,15 @@ def render_steps_for_prompt(steps: list[AgentRunStep]) -> str:
     return "\n".join(lines)
 
 
+def build_memory_context(summary: str | None, steps: list[AgentRunStep]) -> str:
+    parts: list[str] = []
+    if summary:
+        parts.append("Summary memory:\n" + summary.strip())
+    if steps:
+        parts.append("Recent steps:\n" + render_steps_for_prompt(steps))
+    return "\n\n".join(parts)
+
+
 def _safe_json_preview(raw: str | None) -> str:
     if not raw:
         return ""

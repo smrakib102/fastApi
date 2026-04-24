@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% set title = "Settings" %}
+{% set subtitle = "Manage API keys and workspace preferences." %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>AI provider keys</h2>
+        <p>Add personal keys to override admin defaults.</p>
+    </div>
+    <form class="form-stack" method="post" action="/dashboard/keys">
+        <label>
+            <span>OpenAI API key</span>
+            <input type="text" name="openai_api_key" placeholder="Leave empty to use admin key" />
+        </label>
+        <label>
+            <span>Gemini API key</span>
+            <input type="text" name="gemini_api_key" placeholder="Leave empty to use admin key" />
+        </label>
+        <button class="btn" type="submit">Save keys</button>
+    </form>
+    <p class="muted">
+        OpenAI configured: {{ "yes" if key_map.get("openai_api_key") else "no" }} · Gemini configured: {{ "yes" if key_map.get("gemini_api_key") else "no" }}
+    </p>
+</section>
+{% endblock %}

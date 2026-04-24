@@ -1,0 +1,20 @@
+<a class="run-card" href="/dashboard/runs/{{ run.id }}">
+    <div class="run-card-top">
+        <div>
+            <div class="run-title">Run #{{ run.id }}</div>
+            <div class="run-meta">{{ run.agent_name or "Unknown agent" }}</div>
+        </div>
+        <span class="status-pill status-{{ run.status }}">{{ run.status }}</span>
+    </div>
+    <div class="run-card-body">
+        <div class="run-meta">Steps: {{ run.steps }}</div>
+        <div class="run-meta">Created: {{ run.created_at }}</div>
+        {% if run.error_message %}
+            <div class="run-error">{{ run.error_message }}</div>
+        {% endif %}
+        {% if run.input_text %}
+            <div class="run-snippet">{{ run.input_text }}</div>
+        {% endif %}
+        <button class="btn btn-ghost" type="button" data-inspect-run="{{ run.id }}">Inspect run</button>
+    </div>
+</a>

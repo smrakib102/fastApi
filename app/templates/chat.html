@@ -1,0 +1,422 @@
+{% extends "base.html" %}
+{% set title = "Chat" %}
+{% set subtitle = "Your agents respond here in real time." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/dashboard/runs">Run history</a>
+<a class="btn" href="/agents/new">New agent</a>
+{% endblock %}
+{% block content %}
+<section class="chat-shell">
+    <div class="card">
+        <div class="card-header">
+            <h2>Chat workspace</h2>
+            <p>Start a conversation to create agents, launch runs, and inspect outputs.</p>
+        </div>
+        <div class="form-stack">
+            <label>
+                <span>Active agent</span>
+                <select id="agent-select"></select>
+            </label>
+        </div>
+    </div>
+
+    <div class="chat-window">
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-status" id="chat-status">Ready</div>
+        <div class="chat-composer">
+            <input id="chat-input" class="chat-input" placeholder="Ask your agent something..." />
+            <button id="chat-send" class="btn">Send</button>
+        </div>
+    </div>
+</section>
+
+<script>
+    const agentSelect = document.getElementById("agent-select");
+    const chatMessages = document.getElementById("chat-messages");
+    const chatStatus = document.getElementById("chat-status");
+    const chatInput = document.getElementById("chat-input");
+    const chatSend = document.getElementById("chat-send");
+
+    const runMap = new Map();
+    const agentCache = new Map();
+    const insightCache = new Map();
+
+    function buildSuggestions(run, steps) {
+        const suggestions = [];
+        if (!run) {
+            return suggestions;
+        }
+        const failedSteps = steps.filter((step) => step.status === "failed");
+        const toolSteps = steps.filter((step) => step.action_type === "tool");
+        if (run.status === "failed") {
+            suggestions.push("Review the failed step details and retry with adjusted input.");
+        }
+        if (failedSteps.length) {
+            suggestions.push("Consider switching or reconfiguring the tool used in the failed step.");
+        }
+        if (!toolSteps.length) {
+            suggestions.push("Add a tool to speed up data access or automation.");
+        }
+        if (run.status === "completed") {
+            suggestions.push("Run again with refined prompt for higher precision.");
+            suggestions.push("Turn this workflow into a reusable agent template.");
+        }
+        return suggestions.slice(0, 3);
+    }
+
+    function explainRun(steps, run) {
+        if (!steps.length) {
+            return "No steps recorded for this run.";
+        }
+        const tools = [...new Set(steps.map((step) => step.tool_name).filter(Boolean))];
+        const thoughts = steps.filter((step) => step.thought).map((step) => step.thought);
+        const summary = thoughts.slice(0, 2).join(" ") || "The agent executed the planned steps.";
+        const outcome = run.status === "completed" ? "It completed successfully." : "It ended with a failure.";
+        return `${summary} ${outcome} Tools used: ${tools.length ? tools.join(", ") : "none"}.`;
+    }
+
+    function buildToolScoreMap(insights) {
+        const scores = new Map();
+        if (!insights) {
+            return scores;
+        }
+        (insights.successful_patterns || []).forEach((item) => {
+            if (item.tool) {
+                scores.set(item.tool, 0.75);
+            }
+        });
+        (insights.failing_tools || []).forEach((item) => {
+            if (item.tool) {
+                scores.set(item.tool, 0.35);
+            }
+        });
+        return scores;
+    }
+
+    function rankCandidateTools(candidates, insights) {
+        const baseScores = buildToolScoreMap(insights);
+        return (candidates || [])
+            .map((tool) => {
+                const score = baseScores.has(tool) ? baseScores.get(tool) : 0.5;
+                return { tool, score: score.toFixed(2) };
+            })
+            .sort((a, b) => parseFloat(b.score) - parseFloat(a.score));
+    }
+
+    function buildDecisionTrace(steps) {
+        const trace = [];
+        steps.forEach((step) => {
+            if (step.action_type === "tool") {
+                trace.push(`Tool ${step.tool_name || "unknown"} ${step.status}`);
+            }
+            if (step.action_type === "recovery") {
+                trace.push("Recovery plan applied after tool failure");
+            }
+            if (step.status === "failed") {
+                trace.push("Failure detected, fallback or retry triggered");
+            }
+        });
+        return trace.slice(-6);
+    }
+
+    function buildReasoningSummary(steps, run, insights) {
+        const planStep = steps.find((step) => step.action_type === "plan");
+        const planThought = planStep?.thought || "";
+        const improvements = insights?.recommended_improvements || [];
+        if (planThought) {
+            return planThought;
+        }
+        if (improvements.length) {
+            return improvements[0];
+        }
+        return run.summary_memory || "Planner followed the request context and available tools.";
+    }
+
+    function buildExplainResponse(steps, run, insights) {
+        const lines = [];
+        lines.push(buildReasoningSummary(steps, run, insights));
+        const planStep = steps.find((step) => step.action_type === "plan");
+        if (planStep?.output?.steps) {
+            lines.push("Planner decisions:");
+            planStep.output.steps.slice(0, 4).forEach((item) => {
+                const tool = Array.isArray(item.tool) ? item.tool.join(", ") : item.tool || "";
+                lines.push(`- Step ${item.step}: ${item.action} ${tool ? `(${tool})` : ""}`);
+            });
+        }
+        const toolSteps = steps.filter((step) => step.action_type === "tool");
+        if (toolSteps.length) {
+            lines.push("Tool outputs:");
+            toolSteps.slice(0, 3).forEach((step) => {
+                const output = step.output ? JSON.stringify(step.output).slice(0, 120) : "no output";
+                lines.push(`- ${step.tool_name || "tool"}: ${output}`);
+            });
+        }
+        return lines.join("\n");
+    }
+
+    async function fetchAgentInsights(agentId) {
+        if (!agentId) {
+            return null;
+        }
+        if (insightCache.has(agentId)) {
+            return insightCache.get(agentId);
+        }
+        const response = await fetch(`/insights/agents/${agentId}`);
+        if (!response.ok) {
+            return null;
+        }
+        const payload = await response.json();
+        insightCache.set(agentId, payload);
+        return payload;
+    }
+
+    function addMessage(content, role, meta) {
+        const bubble = document.createElement("div");
+        bubble.className = `chat-bubble ${role}`;
+        const text = document.createElement("div");
+        text.className = "chat-text";
+        text.textContent = content;
+        bubble.appendChild(text);
+        if (meta) {
+            const metaEl = document.createElement("div");
+            metaEl.className = "chat-meta";
+            metaEl.innerHTML = meta;
+            bubble.appendChild(metaEl);
+        }
+        chatMessages.appendChild(bubble);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        return bubble;
+    }
+
+    function renderRunStepsInline(runId, steps, target) {
+        const existing = target.querySelector(".chat-step-list");
+        if (existing) {
+            existing.remove();
+        }
+        const list = document.createElement("div");
+        list.className = "chat-step-list";
+        steps.forEach((step) => {
+            const item = document.createElement("div");
+            item.className = "chat-step";
+            item.innerHTML = `
+                <div class="chat-step-title">Step ${step.step_number || step.step_index} · ${step.action_type || step.kind}</div>
+                <div class="chat-meta">${step.tool_name || ""}</div>
+                <button class="btn btn-ghost" data-step-id="${step.id}">Inspect step</button>
+            `;
+            item.querySelector("button").addEventListener("click", () => {
+                window.workspaceInspector.setStep(step);
+            });
+            list.appendChild(item);
+        });
+        target.appendChild(list);
+    }
+
+    async function loadAgents() {
+        const response = await fetch("/agents");
+        if (!response.ok) {
+            agentSelect.innerHTML = "<option>Unable to load agents</option>";
+            return;
+        }
+        const payload = await response.json();
+        agentSelect.innerHTML = "";
+        payload.items.forEach((agent) => {
+            const option = document.createElement("option");
+            option.value = agent.id;
+            option.textContent = `${agent.name} · ${agent.role}`;
+            agentSelect.appendChild(option);
+            agentCache.set(agent.id, agent);
+        });
+        if (!payload.items.length) {
+            agentSelect.innerHTML = "<option value=\"\">No agents yet</option>";
+        }
+        if (window.workspaceInspector?.state?.selectedAgentId) {
+            agentSelect.value = window.workspaceInspector.state.selectedAgentId;
+        }
+    }
+
+    async function sendMessage() {
+        const message = chatInput.value.trim();
+        if (!message) {
+            return;
+        }
+        const agentId = agentSelect.value;
+        if (!agentId) {
+            chatStatus.textContent = "Create an agent first.";
+            return;
+        }
+
+        addMessage(message, "user", null);
+        chatInput.value = "";
+        chatStatus.textContent = "Running...";
+
+        const response = await fetch(`/agents/${agentId}/run`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ input_text: message, async_mode: true }),
+        });
+
+        if (!response.ok) {
+            chatStatus.textContent = "Failed to start run.";
+            return;
+        }
+
+        const payload = await response.json();
+        const runId = payload.run_id;
+        const placeholder = addMessage(
+            "Run started...",
+            "agent",
+            `Run #${runId} · <a class=\"chat-link\" href=\"/dashboard/runs/${runId}\">Open timeline</a> · <button class=\"btn btn-ghost\" data-show-steps=\"${runId}\">Show steps</button> · <button class=\"btn btn-ghost\" data-explain-run=\"${runId}\">Explain</button> · <button class=\"btn btn-ghost\" data-explain-response=\"${runId}\">Explain this response</button>`
+        );
+        const statusBlock = document.createElement("div");
+        statusBlock.className = "chat-suggestion";
+        statusBlock.innerHTML = `
+            <div class=\"typing-indicator\">
+                <span>Working</span>
+                <span class=\"typing-dot\"></span>
+                <span class=\"typing-dot\"></span>
+                <span class=\"typing-dot\"></span>
+            </div>
+            <div class=\"step-progress\"><div class=\"step-progress-bar\"></div></div>
+        `;
+        placeholder.appendChild(statusBlock);
+        placeholder.dataset.runId = runId;
+        placeholder.addEventListener("click", async () => {
+            const runState = runMap.get(runId);
+            if (runState && runState.lastPayload) {
+                const agentInsights = await fetchAgentInsights(runState.agentId);
+                const suggestions = buildSuggestions(runState.lastPayload.run, runState.steps || []);
+                const reasoningSummary = buildReasoningSummary(runState.steps || [], runState.lastPayload.run, agentInsights);
+                const decisionTrace = buildDecisionTrace(runState.steps || []);
+                const toolScores = rankCandidateTools(
+                    (agentCache.get(runState.agentId) || {}).tools || [],
+                    agentInsights
+                ).slice(0, 3);
+                window.workspaceInspector.setRunContext({
+                    run: runState.lastPayload.run,
+                    steps: runState.steps,
+                    suggestions: suggestions,
+                    reasoningSummary: reasoningSummary,
+                    decisionTrace: decisionTrace,
+                    toolScoring: toolScores,
+                });
+            }
+        });
+        placeholder.querySelector("[data-show-steps]")?.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const response = await fetch(`/runs/${runId}/timeline`);
+            if (!response.ok) {
+                return;
+            }
+            const payload = await response.json();
+            renderRunStepsInline(runId, payload.steps || [], placeholder);
+        });
+        placeholder.querySelector("[data-explain-run]")?.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const response = await fetch(`/runs/${runId}/timeline`);
+            if (!response.ok) {
+                return;
+            }
+            const payload = await response.json();
+            const explanation = explainRun(payload.steps || [], payload.run || {});
+            addMessage(explanation, "agent", "Run explanation");
+        });
+        placeholder.querySelector("[data-explain-response]")?.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const response = await fetch(`/runs/${runId}/timeline`);
+            if (!response.ok) {
+                return;
+            }
+            const payload = await response.json();
+            const agentInsights = await fetchAgentInsights(agentId);
+            const explanation = buildExplainResponse(payload.steps || [], payload.run || {}, agentInsights);
+            addMessage(explanation, "agent", "Explain this response");
+        });
+        runMap.set(runId, { node: placeholder, done: false, lastStep: 0, steps: [], agentId: agentId });
+        pollRun(runId);
+    }
+
+    async function pollRun(runId) {
+        const run = runMap.get(runId);
+        if (!run || run.done) {
+            return;
+        }
+        const response = await fetch(`/runs/${runId}/stream?since_step=${run.lastStep}`);
+        if (!response.ok) {
+            setTimeout(() => pollRun(runId), 2000);
+            return;
+        }
+        const payload = await response.json();
+        run.lastPayload = payload;
+        if (payload.latest_step !== undefined) {
+            run.lastStep = payload.latest_step;
+        }
+        if (payload.steps && payload.steps.length) {
+            run.steps = run.steps.concat(payload.steps);
+            const latest = payload.steps[payload.steps.length - 1];
+            if (latest.action_type === "tool") {
+                chatStatus.textContent = latest.status === "success" ? "Tool completed" : "Running tool...";
+            } else if (latest.action_type === "plan" || latest.action_type === "think") {
+                chatStatus.textContent = "Thinking...";
+            }
+        }
+        if (payload.run) {
+            const status = payload.run.status;
+            const output = payload.run.output_text || "";
+            run.node.querySelector("div").textContent = output || `Run ${status}...`;
+            const agentInsights = await fetchAgentInsights(run.agentId);
+            const suggestions = buildSuggestions(payload.run, run.steps || []);
+            const reasoningSummary = buildReasoningSummary(run.steps || [], payload.run, agentInsights);
+            const decisionTrace = buildDecisionTrace(run.steps || []);
+            const toolScores = rankCandidateTools(
+                (agentCache.get(run.agentId) || {}).tools || [],
+                agentInsights
+            ).slice(0, 3);
+            window.workspaceInspector.setRunContext({
+                run: payload.run,
+                steps: run.steps,
+                suggestions: suggestions,
+                reasoningSummary: reasoningSummary,
+                decisionTrace: decisionTrace,
+                toolScoring: toolScores,
+            });
+            if (status === "completed" || status === "failed") {
+                run.done = true;
+                chatStatus.textContent = `Run ${status}`;
+                const summary = explainRun(run.steps || [], payload.run);
+                addMessage(summary, "agent", "Summary");
+                if (suggestions.length) {
+                    addMessage("Suggested next actions:", "agent", suggestions.map((item) => `• ${item}`).join("<br />"));
+                }
+                window.workspaceInspector.addRunHistory({
+                    id: payload.run.id,
+                    status: payload.run.status,
+                });
+            }
+        }
+        if (!run.done) {
+            setTimeout(() => pollRun(runId), 1500);
+        }
+    }
+
+    chatSend.addEventListener("click", sendMessage);
+    chatInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            sendMessage();
+        }
+    });
+
+    agentSelect.addEventListener("change", () => {
+        const id = agentSelect.value;
+        if (!id) {
+            return;
+        }
+        window.workspaceInspector.state.selectedAgentId = id;
+        sessionStorage.setItem("workspace_state", JSON.stringify(window.workspaceInspector.state));
+    });
+
+    loadAgents();
+</script>
+{% endblock %}

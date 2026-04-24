@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
 from app.models.agent_run_step import AgentRunStep
+from app.services.agent_analytics import record_run_outcome, record_tool_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,10 @@ def add_step(
     tool_name: str | None = None,
     input_data: dict | None = None,
     output_data: dict | str | None = None,
+    tokens_used: int | None = None,
+    cost_usd: float | None = None,
     kind: str | None = None,
+    reasoning: dict | None = None,
 ) -> AgentRunStep:
     payload = {
         "step_number": step_number,
@@ -52,6 +56,9 @@ def add_step(
         "tool_name": tool_name,
         "input": input_data,
         "output": output_data,
+        "tokens_used": tokens_used,
+        "cost_usd": cost_usd,
+        "reasoning": reasoning,
     }
 
     step = AgentRunStep(
@@ -65,21 +72,31 @@ def add_step(
         tool_name=tool_name,
         input_json=json.dumps(input_data, ensure_ascii=True) if input_data is not None else None,
         output_json=json.dumps(output_data, ensure_ascii=True) if output_data is not None else None,
+        tokens_used=tokens_used,
+        cost_usd=cost_usd,
         content=json.dumps(payload, ensure_ascii=True),
+        reasoning_json=json.dumps(reasoning, ensure_ascii=True) if reasoning is not None else None,
     )
     db.add(step)
+    db.query(AgentRun).filter(AgentRun.id == run_id).update({"updated_at": datetime.now(timezone.utc)})
     db.commit()
     db.refresh(step)
     logger.info(
         "agent_step",
         extra={
             "run_id": run_id,
+            "step_id": step.id,
             "step_number": step_number,
             "action_type": action_type,
             "status": status,
             "tool_name": tool_name,
+            "tokens_used": tokens_used,
+            "cost_usd": cost_usd,
         },
     )
+    if action_type == "tool" and tool_name:
+        success = status in {"success", "retry"}
+        record_tool_outcome(db, run_id, tool_name, success)
     return step
 
 
@@ -98,3 +115,4 @@ def finalize_run(
     db.add(run)
     db.commit()
     db.refresh(run)
+    record_run_outcome(db, run)

@@ -1,5 +1,10 @@
 import base64
+import hashlib
+import hmac
 import json
+import logging
+import time
+import uuid
 from email.message import EmailMessage
 
 import httpx
@@ -16,6 +21,10 @@ from app.services.audit_log import record_audit
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
+_nonce_cache: dict[str, float] = {}
+
 GMAIL_DRAFT_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send"
 CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
@@ -29,8 +38,105 @@ class ToolExecuteRequest(BaseModel):
 
 
 def _require_tool_token(x_tool_token: str | None) -> None:
-    if settings.tool_api_token and x_tool_token != settings.tool_api_token:
+    if not settings.tool_api_token:
+        raise HTTPException(status_code=403, detail="Tool API disabled")
+    if x_tool_token != settings.tool_api_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _canonical_payload(payload: ToolExecuteRequest) -> str:
+    return json.dumps(payload.model_dump(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _validate_internal_signature(
+    user_id: int,
+    tool_payload: ToolExecuteRequest,
+    timestamp: int,
+    nonce: str,
+    signature: str | None,
+) -> None:
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing internal signature")
+
+    now = int(time.time())
+    if abs(now - timestamp) > 30:
+        raise HTTPException(status_code=401, detail="Request expired")
+
+    payload_text = _canonical_payload(tool_payload)
+    message = f"{user_id}:{timestamp}:{nonce}:{payload_text}".encode("utf-8")
+    expected = hmac.new(
+        settings.tool_api_token.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid internal signature")
+
+
+def _validate_nonce(nonce: str) -> None:
+    try:
+        uuid.UUID(nonce)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid nonce") from exc
+
+    now = time.time()
+    cutoff = now - 60
+    expired = [key for key, expires_at in _nonce_cache.items() if expires_at <= cutoff]
+    for key in expired:
+        _nonce_cache.pop(key, None)
+
+    if nonce in _nonce_cache:
+        raise HTTPException(status_code=401, detail="Nonce replay detected")
+
+    _nonce_cache[nonce] = now + 60
+
+
+def _execute_tool_internal(
+    payload: ToolExecuteRequest,
+    db: Session,
+    internal_user_id: int,
+    internal_agent_id: int | None,
+) -> dict:
+    if "user_id" in payload.arguments:
+        raise HTTPException(status_code=400, detail="user_id must not be provided")
+
+    usage_provider = payload.arguments.get("provider")
+    usage_tokens = payload.arguments.get("tokens")
+    if usage_provider and usage_tokens:
+        check_and_record_usage(
+            db,
+            int(internal_user_id),
+            str(usage_provider),
+            int(usage_tokens),
+        )
+
+    record_audit(
+        db,
+        int(internal_user_id),
+        "tool_execute",
+        "tool",
+        payload.name,
+        {"agent_id": internal_agent_id},
+    )
+
+    if payload.name == "gmail.draft":
+        return _gmail_draft(payload.arguments, db, internal_user_id)
+    if payload.name == "gmail.send_request":
+        return _gmail_send_request(payload.arguments, db, internal_user_id, internal_agent_id)
+    if payload.name == "gmail.send":
+        return _gmail_send(payload.arguments, db, internal_user_id)
+    if payload.name == "gmail.profile":
+        return _gmail_profile(db, internal_user_id)
+    if payload.name == "calendar.list":
+        return _calendar_list(db, internal_user_id)
+    if payload.name == "calendar.create_request":
+        return _calendar_create_request(payload.arguments, db, internal_user_id, internal_agent_id)
+    if payload.name == "gmail.list_messages":
+        return _gmail_list_messages(payload.arguments, db, internal_user_id)
+    if payload.name == "gmail.list_drafts":
+        return _gmail_list_drafts(payload.arguments, db, internal_user_id)
+
+    raise HTTPException(status_code=404, detail="Unknown tool")
 
 
 def _build_raw_message(to: str, subject: str, body: str) -> str:
@@ -223,14 +329,12 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "to": {"type": "string"},
                         "subject": {"type": "string"},
                         "body": {"type": "string"},
                         "thread_id": {"type": "string"},
                     },
-                    "required": ["user_id", "to", "subject", "body"],
+                    "required": ["to", "subject", "body"],
                 },
             },
             {
@@ -239,12 +343,10 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "draft_id": {"type": "string"},
                         "reason": {"type": "string"},
                     },
-                    "required": ["user_id", "draft_id"],
+                    "required": ["draft_id"],
                 },
             },
             {
@@ -253,11 +355,9 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "draft_id": {"type": "string"},
                     },
-                    "required": ["user_id", "draft_id"],
+                    "required": ["draft_id"],
                 },
             },
             {
@@ -265,8 +365,8 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "description": "Fetch Gmail profile data.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"user_id": {"type": "integer"}, "agent_id": {"type": "integer"}},
-                    "required": ["user_id"],
+                    "properties": {},
+                    "required": [],
                 },
             },
             {
@@ -274,8 +374,8 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "description": "List Google calendars.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"user_id": {"type": "integer"}, "agent_id": {"type": "integer"}},
-                    "required": ["user_id"],
+                    "properties": {},
+                    "required": [],
                 },
             },
             {
@@ -284,8 +384,6 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "calendar_id": {"type": "string"},
                         "summary": {"type": "string"},
                         "description": {"type": "string"},
@@ -293,7 +391,7 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                         "end": {"type": "object"},
                         "attendees": {"type": "array"},
                     },
-                    "required": ["user_id", "calendar_id", "summary", "start", "end"],
+                    "required": ["calendar_id", "summary", "start", "end"],
                 },
             },
             {
@@ -302,12 +400,10 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "max_results": {"type": "integer"},
                         "q": {"type": "string"},
                     },
-                    "required": ["user_id"],
+                    "required": [],
                 },
             },
             {
@@ -316,11 +412,9 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "user_id": {"type": "integer"},
-                        "agent_id": {"type": "integer"},
                         "max_results": {"type": "integer"},
                     },
-                    "required": ["user_id"],
+                    "required": [],
                 },
             },
         ]
@@ -331,53 +425,31 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
 def tool_execute(
     payload: ToolExecuteRequest,
     x_tool_token: str | None = Header(default=None),
+    x_internal_user_id: str | None = Header(default=None),
+    x_internal_agent_id: str | None = Header(default=None),
+    x_internal_timestamp: str | None = Header(default=None),
+    x_internal_request: str | None = Header(default=None),
+    x_internal_nonce: str | None = Header(default=None),
+    x_internal_signature: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     _require_tool_token(x_tool_token)
+    if x_internal_request != "true":
+        logger.warning("tool_execute_signal", extra={"reason": "missing_internal_marker"})
+    if not x_internal_user_id or not x_internal_user_id.isdigit():
+        logger.warning("tool_execute_rejected", extra={"reason": "missing_user_context"})
+        raise HTTPException(status_code=401, detail="Missing internal context")
+    if not x_internal_timestamp or not x_internal_timestamp.isdigit():
+        logger.warning("tool_execute_rejected", extra={"reason": "missing_timestamp"})
+        raise HTTPException(status_code=401, detail="Missing internal timestamp")
+    if not x_internal_nonce:
+        logger.warning("tool_execute_rejected", extra={"reason": "missing_nonce"})
+        raise HTTPException(status_code=401, detail="Missing nonce")
 
-    usage_provider = payload.arguments.get("provider")
-    usage_tokens = payload.arguments.get("tokens")
-    usage_user_id = payload.arguments.get("user_id")
-    if usage_provider and usage_tokens and usage_user_id:
-        check_and_record_usage(
-            db,
-            int(usage_user_id),
-            str(usage_provider),
-            int(usage_tokens),
-        )
+    internal_user_id = int(x_internal_user_id)
+    internal_agent_id = int(x_internal_agent_id) if x_internal_agent_id and x_internal_agent_id.isdigit() else None
+    internal_timestamp = int(x_internal_timestamp)
+    _validate_nonce(x_internal_nonce)
+    _validate_internal_signature(internal_user_id, payload, internal_timestamp, x_internal_nonce, x_internal_signature)
 
-    user_id = payload.arguments.get("user_id")
-    agent_id = payload.arguments.get("agent_id")
-    if user_id is None:
-        raise HTTPException(status_code=400, detail="Missing user_id")
-    user_id = int(user_id)
-    if agent_id is not None:
-        agent_id = int(agent_id)
-
-    record_audit(
-        db,
-        user_id,
-        "tool_execute",
-        "tool",
-        payload.name,
-        {"agent_id": agent_id},
-    )
-
-    if payload.name == "gmail.draft":
-        return _gmail_draft(payload.arguments, db, user_id)
-    if payload.name == "gmail.send_request":
-        return _gmail_send_request(payload.arguments, db, user_id, agent_id)
-    if payload.name == "gmail.send":
-        return _gmail_send(payload.arguments, db, user_id)
-    if payload.name == "gmail.profile":
-        return _gmail_profile(db, user_id)
-    if payload.name == "calendar.list":
-        return _calendar_list(db, user_id)
-    if payload.name == "calendar.create_request":
-        return _calendar_create_request(payload.arguments, db, user_id, agent_id)
-    if payload.name == "gmail.list_messages":
-        return _gmail_list_messages(payload.arguments, db, user_id)
-    if payload.name == "gmail.list_drafts":
-        return _gmail_list_drafts(payload.arguments, db, user_id)
-
-    raise HTTPException(status_code=404, detail="Unknown tool")
+    return _execute_tool_internal(payload, db, internal_user_id, internal_agent_id)

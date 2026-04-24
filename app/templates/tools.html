@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% set title = "Tools" %}
+{% set subtitle = "Connect external systems and credentials." %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>Tool connections</h2>
+        <p>Manage integrations used by your agents.</p>
+    </div>
+    <div class="panel-grid">
+        <div class="panel-card">
+            <div class="panel-title">Telegram</div>
+            <div class="muted">Connect your bot to enable chat-based workflows.</div>
+            <button class="btn" id="connect-telegram">Connect Telegram</button>
+            <div class="chat-status" id="telegram-status"></div>
+        </div>
+        <div class="panel-card">
+            <div class="panel-title">Google Workspace</div>
+            <div class="muted">Gmail and Calendar actions are available once OAuth is enabled.</div>
+            <button class="btn btn-outline" disabled>OAuth setup needed</button>
+        </div>
+        <div class="panel-card">
+            <div class="panel-title">Custom tools</div>
+            <div class="muted">Register custom tools in the admin panel.</div>
+            <a class="btn btn-secondary" href="/admin/panel">Open admin</a>
+        </div>
+    </div>
+</section>
+
+<script>
+    const connectBtn = document.getElementById("connect-telegram");
+    const statusEl = document.getElementById("telegram-status");
+
+    connectBtn.addEventListener("click", async () => {
+        statusEl.textContent = "Generating link...";
+        const response = await fetch("/telegram/link-token", { method: "POST" });
+        if (!response.ok) {
+            statusEl.textContent = "Unable to generate link.";
+            return;
+        }
+        const payload = await response.json();
+        if (payload.link) {
+            statusEl.innerHTML = `Open <a href=\"${payload.link}\" target=\"_blank\">Telegram link</a> to connect.`;
+        } else {
+            statusEl.textContent = "Bot username not configured.";
+        }
+    });
+</script>
+{% endblock %}

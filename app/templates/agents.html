@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% set title = "Agents" %}
+{% set subtitle = "Create, organize, and launch your agents." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/chat">Open chat</a>
+<a class="btn" href="/agents/new">New agent</a>
+{% endblock %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>Your agents</h2>
+        <p>Launch agents or refine their mission from one place.</p>
+    </div>
+    {% if agents and agents|length > 0 %}
+        <div class="agent-grid">
+            {% for agent in agents %}
+                {% set perf = agent_perf.get(agent.id) if agent_perf else None %}
+                <div class="agent-card" data-agent-id="{{ agent.id }}" data-agent-name="{{ agent.name }}" data-agent-role="{{ agent.role }}" data-agent-model="{{ agent.model }}" data-agent-tools="{{ agent.tools | e }}" data-agent-success="{{ perf.success_rate if perf else '' }}" data-agent-cost="{{ perf.cost_efficiency if perf else '' }}">
+                    <div class="agent-title">{{ agent.name }}</div>
+                    <div class="agent-meta">{{ agent.role }} · {{ agent.category }}</div>
+                    <div class="tag-row">
+                        <span class="tag">{{ agent.model }}</span>
+                        <span class="tag">{{ agent.status }}</span>
+                    </div>
+                    {% if perf %}
+                    <div class="agent-metrics">
+                        <div>
+                            <div class="metric-label">Success</div>
+                            <div class="metric-value">{{ "%.0f" | format((perf.success_rate or 0) * 100) }}%</div>
+                        </div>
+                        <div>
+                            <div class="metric-label">Cost efficiency</div>
+                            <div class="metric-value">{{ "%.2f" | format(perf.cost_efficiency or 0) }}</div>
+                        </div>
+                        <div>
+                            <div class="metric-label">Runs</div>
+                            <div class="metric-value">{{ perf.run_count or 0 }}</div>
+                        </div>
+                    </div>
+                    {% endif %}
+                    <button class="btn btn-ghost" type="button" data-inspect-agent="{{ agent.id }}">Inspect agent</button>
+                    <form class="form-stack" method="post" action="/dashboard/agents/run">
+                        <input type="hidden" name="agent_id" value="{{ agent.id }}" />
+                        <label>
+                            <span>Run input</span>
+                            <input type="text" name="input_text" placeholder="Ask this agent something" />
+                        </label>
+                        <button class="btn" type="submit">Run agent</button>
+                    </form>
+                </div>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p class="muted">No agents yet. Create your first agent to get started.</p>
+    {% endif %}
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Teams</h2>
+        <p>Organize agents into teams for shared workflows.</p>
+    </div>
+    {% if teams and teams|length > 0 %}
+        <div class="agent-grid">
+            {% for team in teams %}
+                <div class="agent-card">
+                    <div class="agent-title">{{ team.name }}</div>
+                    <div class="agent-meta">{{ team.description or "No description" }}</div>
+                    <div class="agent-meta">
+                        Members:
+                        {% if team_agents and team_agents.get(team.id) %}
+                            {{ team_agents.get(team.id) | map(attribute='name') | join(', ') }}
+                        {% else %}
+                            none
+                        {% endif %}
+                    </div>
+                    {% if agents and agents|length > 0 %}
+                        <form class="form-stack" method="post" action="/dashboard/teams/assign">
+                            <input type="hidden" name="team_id" value="{{ team.id }}" />
+                            <label>
+                                <span>Add agent</span>
+                                <select name="agent_id">
+                                    {% for agent in agents %}
+                                        <option value="{{ agent.id }}">{{ agent.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </label>
+                            <button class="btn" type="submit">Add to team</button>
+                        </form>
+                    {% endif %}
+                </div>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p class="muted">No teams yet. Create one when you need shared ownership.</p>
+    {% endif %}
+</section>
+{% endblock %}
+{% block right_panel %}
+<div class="inspector-card" id="inspector-content">
+    <div class="inspector-title">Agent inspector</div>
+    <p class="muted">Select an agent to inspect details.</p>
+</div>
+<script>
+    const agentButtons = document.querySelectorAll("[data-inspect-agent]");
+    agentButtons.forEach((button) => {
+        button.addEventListener("click", async () => {
+            const card = button.closest(".agent-card");
+            if (!card) {
+                return;
+            }
+            const toolsRaw = card.dataset.agentTools || "[]";
+            let tools = [];
+            try {
+                tools = JSON.parse(toolsRaw);
+            } catch (err) {
+                tools = [];
+            }
+            const agentPayload = {
+                id: card.dataset.agentId,
+                name: card.dataset.agentName,
+                role: card.dataset.agentRole,
+                model: card.dataset.agentModel,
+                tools: tools,
+                success_rate: card.dataset.agentSuccess ? parseFloat(card.dataset.agentSuccess) : null,
+                cost_efficiency: card.dataset.agentCost ? parseFloat(card.dataset.agentCost) : null,
+            };
+            const insightResponse = await fetch(`/insights/agents/${card.dataset.agentId}`);
+            if (insightResponse.ok) {
+                const insights = await insightResponse.json();
+                agentPayload.failing_tools = insights.failing_tools || [];
+                agentPayload.successful_patterns = insights.successful_patterns || [];
+            }
+            window.workspaceInspector.setAgent(agentPayload);
+        });
+    });
+</script>
+{% endblock %}

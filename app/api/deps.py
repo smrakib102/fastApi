@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, is_session_active
 from app.db.session import SessionLocal
 from app.models.user import User
 
@@ -62,11 +62,24 @@ def get_current_user(
         subject = payload.get("sub")
         if not subject:
             return None
+        token_type = payload.get("typ")
+        if token_type and token_type != "access":
+            return None
+        jti = payload.get("jti")
+        if settings.require_jti_for_all_tokens and not jti:
+            return None
+        if jti and not is_session_active(jti):
+            return None
         user_id = int(subject)
     except (JWTError, ValueError):
         return None
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="Auth service unavailable") from exc
 
-    return db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if not user or not user.is_active or user.is_locked:
+        return None
+    return user
 
 
 def require_admin_user(current_user: User | None = Depends(get_current_user)) -> User:

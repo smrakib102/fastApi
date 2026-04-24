@@ -7,25 +7,281 @@
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-    <div class="page">
-        <header class="top-bar">
+    <div class="app-shell">
+        <aside class="sidebar">
             <div class="brand">
-                <span class="brand-mark">AI</span>
-                <span class="brand-text">Agent Control</span>
+                <span class="brand-mark">OC</span>
+                <span class="brand-text">OpenClaw</span>
             </div>
             {% if user %}
-            <nav class="nav-links">
-                <a href="/dashboard/agents">Dashboard</a>
+            <nav class="sidebar-nav">
+                <a href="/dashboard" class="nav-item">Dashboard</a>
+                <a href="/chat" class="nav-item">Chat</a>
+                <a href="/dashboard/agents" class="nav-item">Agents</a>
+                <a href="/dashboard/runs" class="nav-item">Runs</a>
+                <a href="/insights" class="nav-item">Insights</a>
+                <a href="/tools" class="nav-item">Tools</a>
+                <a href="/settings" class="nav-item">Settings</a>
                 {% if user.is_admin %}
-                <a href="/admin/panel">Admin</a>
+                <a href="/admin/panel" class="nav-item">Admin</a>
                 {% endif %}
-                <a href="/auth/logout">Sign out</a>
             </nav>
+            <div class="sidebar-footer">
+                <div class="user-chip">
+                    <span class="user-avatar">{{ (user.full_name or user.email)[0]|upper }}</span>
+                    <div>
+                        <div class="user-name">{{ user.full_name or "User" }}</div>
+                        <div class="user-email">{{ user.email }}</div>
+                    </div>
+                </div>
+                <a class="nav-item" href="/auth/logout">Sign out</a>
+            </div>
             {% endif %}
-        </header>
-        <main class="content">
-            {% block content %}{% endblock %}
-        </main>
+        </aside>
+
+        <div class="workspace">
+            <header class="workspace-header">
+                <div>
+                    <div class="workspace-title">{{ title or "Workspace" }}</div>
+                    <div class="workspace-subtitle">{{ subtitle or "" }}</div>
+                </div>
+                <div class="workspace-actions">
+                    {% block header_actions %}{% endblock %}
+                </div>
+            </header>
+            <main class="workspace-body">
+                {% block content %}{% endblock %}
+            </main>
+        </div>
+
+        <aside class="inspector" id="inspector">
+            {% block right_panel %}
+            <div class="inspector-card" id="inspector-content">
+                <div class="inspector-title">Inspector</div>
+                <p class="muted">Select a run or message to inspect.</p>
+            </div>
+            {% endblock %}
+        </aside>
     </div>
+    <script>
+        const workspaceState = {
+            selectedAgentId: null,
+            selectedRunId: null,
+            selectedStep: null,
+            agentSnapshot: null,
+            runSnapshot: null,
+            stepSnapshot: null,
+            runContext: null,
+            runHistory: [],
+        };
+
+        function loadWorkspaceState() {
+            try {
+                const raw = sessionStorage.getItem("workspace_state");
+                if (raw) {
+                    Object.assign(workspaceState, JSON.parse(raw));
+                }
+            } catch (err) {
+                return;
+            }
+        }
+
+        function saveWorkspaceState() {
+            sessionStorage.setItem("workspace_state", JSON.stringify(workspaceState));
+        }
+
+        function setInspectorContent(html) {
+            const container = document.getElementById("inspector-content");
+            if (container) {
+                container.innerHTML = html;
+            }
+        }
+
+        function renderInspectorEmpty() {
+            setInspectorContent(`
+                <div class="inspector-title">Inspector</div>
+                <p class="muted">Select a run, agent, or tool step to inspect.</p>
+            `);
+        }
+
+        function renderRunInspector(run) {
+            if (!run) {
+                renderInspectorEmpty();
+                return;
+            }
+            const reasoningSummary = workspaceState.runContext?.reasoningSummary || "";
+            const toolScoring = workspaceState.runContext?.toolScoring || [];
+            const decisionTrace = workspaceState.runContext?.decisionTrace || [];
+            const suggestions = (workspaceState.runContext && workspaceState.runContext.suggestions)
+                ? workspaceState.runContext.suggestions
+                : [];
+            const related = workspaceState.runHistory
+                .filter((item) => item.id !== run.id)
+                .slice(0, 3)
+                .map((item) => `<li>Run #${item.id} · ${item.status}</li>`)
+                .join("");
+            setInspectorContent(`
+                <div class="inspector-title">Run #${run.id}</div>
+                <div class="card-section">
+                    <div class="run-label">Status</div>
+                    <div class="status-pill status-${run.status}">${run.status}</div>
+                </div>
+                <div class="card-section">
+                    <div class="run-label">Tokens</div>
+                    <div class="run-value">${run.total_tokens || 0}</div>
+                </div>
+                <div class="card-section">
+                    <div class="run-label">Cost</div>
+                    <div class="run-value">$${(run.total_cost_usd || 0).toFixed(4)}</div>
+                </div>
+                <div class="card-section">
+                    <a class="btn btn-outline" href="/dashboard/runs/${run.id}">Open full trace</a>
+                </div>
+                ${reasoningSummary ? `
+                <div class="card-section">
+                    <div class="run-label">Live reasoning summary</div>
+                    <div class="muted">${reasoningSummary}</div>
+                </div>` : ""}
+                ${toolScoring.length ? `
+                <div class="card-section">
+                    <div class="run-label">Tool scoring</div>
+                    <div class="tool-score-list">${toolScoring
+                        .map((item) => `<div class="tool-score-item"><span>${item.tool}</span><span>${item.score}</span></div>`)
+                        .join("")}</div>
+                </div>` : ""}
+                ${decisionTrace.length ? `
+                <div class="card-section">
+                    <div class="run-label">Decision trace</div>
+                    <ul class="trace-list">${decisionTrace.map((item) => `<li>${item}</li>`).join("")}</ul>
+                </div>` : ""}
+                ${suggestions.length ? `
+                <div class="card-section">
+                    <div class="run-label">Suggested next actions</div>
+                    <div class="suggestion-list">${suggestions.map((item) => `<div class="suggestion">${item}</div>`).join("")}</div>
+                </div>` : ""}
+                ${related ? `
+                <div class="card-section">
+                    <div class="run-label">Related runs</div>
+                    <ul class="related-list">${related}</ul>
+                </div>` : ""}
+            `);
+        }
+
+        function renderAgentInspector(agent) {
+            if (!agent) {
+                renderInspectorEmpty();
+                return;
+            }
+            const tools = (agent.tools || []).map((tool) => `<span class="tag tool-pill">${tool}</span>`).join("");
+            const failingTools = (agent.failing_tools || []).map((item) => `<span class="tag warn-pill">${item.tool}</span>`).join("");
+            const topTools = (agent.successful_patterns || []).map((item) => `<span class="tag tool-pill">${item.tool}</span>`).join("");
+            setInspectorContent(`
+                <div class="inspector-title">${agent.name}</div>
+                <div class="card-section">
+                    <div class="run-label">Role</div>
+                    <div class="run-value">${agent.role}</div>
+                </div>
+                <div class="card-section">
+                    <div class="run-label">Model</div>
+                    <div class="run-value">${agent.model}</div>
+                </div>
+                ${agent.success_rate !== undefined && agent.success_rate !== null ? `
+                <div class="card-section">
+                    <div class="run-label">Success rate</div>
+                    <div class="run-value">${(agent.success_rate * 100).toFixed(0)}%</div>
+                </div>` : ""}
+                ${agent.cost_efficiency !== undefined && agent.cost_efficiency !== null ? `
+                <div class="card-section">
+                    <div class="run-label">Cost efficiency</div>
+                    <div class="run-value">${agent.cost_efficiency.toFixed(2)}</div>
+                </div>` : ""}
+                <div class="card-section">
+                    <div class="run-label">Tools</div>
+                    <div class="tag-row">${tools || "<span class=\"muted\">No tools</span>"}</div>
+                </div>
+                ${topTools ? `
+                <div class="card-section">
+                    <div class="run-label">Most used tools</div>
+                    <div class="tag-row">${topTools}</div>
+                </div>` : ""}
+                ${failingTools ? `
+                <div class="card-section">
+                    <div class="run-label">Failure patterns</div>
+                    <div class="tag-row">${failingTools || "<span class=\"muted\">No failing tools</span>"}</div>
+                </div>` : ""}
+            `);
+        }
+
+        function renderStepInspector(step) {
+            if (!step) {
+                renderInspectorEmpty();
+                return;
+            }
+            const input = step.input ? `<pre class="inspector-json">${JSON.stringify(step.input, null, 2)}</pre>` : "";
+            const output = step.output ? `<pre class="inspector-json">${JSON.stringify(step.output, null, 2)}</pre>` : "";
+            setInspectorContent(`
+                <div class="inspector-title">Step ${step.step_number || step.step_index}</div>
+                <div class="card-section">
+                    <div class="run-label">Status</div>
+                    <div class="status-pill status-${step.status}">${step.status}</div>
+                </div>
+                <div class="card-section">
+                    <div class="run-label">Tool</div>
+                    <div class="run-value">${step.tool_name || "-"}</div>
+                </div>
+                ${input ? `<div class="card-section"><div class="run-label">Input</div>${input}</div>` : ""}
+                ${output ? `<div class="card-section"><div class="run-label">Output</div>${output}</div>` : ""}
+            `);
+        }
+
+        window.workspaceInspector = {
+            setRun(run) {
+                workspaceState.selectedRunId = run ? run.id : null;
+                workspaceState.selectedStep = null;
+                workspaceState.runSnapshot = run || null;
+                workspaceState.stepSnapshot = null;
+                workspaceState.runContext = null;
+                saveWorkspaceState();
+                renderRunInspector(run);
+            },
+            setRunContext(payload) {
+                workspaceState.runContext = payload || null;
+                if (payload && payload.run) {
+                    workspaceState.runSnapshot = payload.run;
+                }
+                saveWorkspaceState();
+                renderRunInspector(payload ? payload.run : null);
+            },
+            setAgent(agent) {
+                workspaceState.selectedAgentId = agent ? agent.id : null;
+                workspaceState.agentSnapshot = agent || null;
+                saveWorkspaceState();
+                renderAgentInspector(agent);
+            },
+            setStep(step) {
+                workspaceState.selectedStep = step || null;
+                workspaceState.stepSnapshot = step || null;
+                saveWorkspaceState();
+                renderStepInspector(step);
+            },
+            addRunHistory(entry) {
+                if (!entry) {
+                    return;
+                }
+                workspaceState.runHistory = [entry, ...workspaceState.runHistory.filter((item) => item.id !== entry.id)].slice(0, 5);
+                saveWorkspaceState();
+            },
+            state: workspaceState,
+        };
+
+        loadWorkspaceState();
+        if (workspaceState.stepSnapshot) {
+            renderStepInspector(workspaceState.stepSnapshot);
+        } else if (workspaceState.runSnapshot) {
+            renderRunInspector(workspaceState.runSnapshot);
+        } else if (workspaceState.agentSnapshot) {
+            renderAgentInspector(workspaceState.agentSnapshot);
+        }
+    </script>
 </body>
 </html>

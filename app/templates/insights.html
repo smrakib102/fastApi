@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% set title = "Insights" %}
+{% set subtitle = "Explainable intelligence and performance analytics." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/dashboard">Back to dashboard</a>
+{% endblock %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>System health</h2>
+        <p>Live overview of agent reliability and tool performance.</p>
+    </div>
+    <div class="insight-grid" id="insight-overview">
+        <div class="insight-card">Loading insights...</div>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Top performing agents</h2>
+        <p>Highest success rate based on recent runs.</p>
+    </div>
+    <div class="insight-grid" id="insight-agents"></div>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Failing tools</h2>
+        <p>Tools with repeated failures or low success rates.</p>
+    </div>
+    <div class="insight-grid" id="insight-tools"></div>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Most expensive runs</h2>
+        <p>Estimated from model cost averages.</p>
+    </div>
+    <div class="insight-grid" id="insight-cost"></div>
+</section>
+
+<script>
+    const agentSeeds = {{ agents | tojson }};
+
+    function renderCard(title, value, meta) {
+        return `
+            <div class="insight-card">
+                <div class="insight-title">${title}</div>
+                <div class="insight-value">${value}</div>
+                <div class="insight-meta">${meta || ""}</div>
+            </div>
+        `;
+    }
+
+    async function loadOverview() {
+        const response = await fetch("/insights/overview");
+        if (!response.ok) {
+            document.getElementById("insight-overview").innerHTML = renderCard("Insights", "Unavailable", "Check back soon.");
+            return;
+        }
+        const data = await response.json();
+        const overview = document.getElementById("insight-overview");
+        overview.innerHTML = "";
+
+        const improvements = (data.recommended_improvements || []).slice(0, 2).join(" ") || "No critical improvements detected.";
+        const failing = data.failing_tools?.length || 0;
+        const patterns = data.successful_patterns?.length || 0;
+
+        overview.innerHTML += renderCard("Recommended focus", improvements, "Planner guidance");
+        overview.innerHTML += renderCard("Failing tools", failing, "Based on analytics");
+        overview.innerHTML += renderCard("Successful patterns", patterns, "High confidence tools");
+    }
+
+    async function loadAgents() {
+        const target = document.getElementById("insight-agents");
+        target.innerHTML = "";
+        const summaries = [];
+
+        for (const agent of agentSeeds) {
+            const response = await fetch(`/insights/agents/${agent.id}`);
+            if (!response.ok) {
+                continue;
+            }
+            const data = await response.json();
+            const perf = data.agent_performance;
+            if (!perf) {
+                continue;
+            }
+            summaries.push({
+                name: agent.name,
+                success_rate: perf.success_rate || 0,
+                reliability: perf.reliability_score || 0,
+            });
+        }
+
+        summaries.sort((a, b) => b.success_rate - a.success_rate);
+        summaries.slice(0, 4).forEach((item) => {
+            target.innerHTML += renderCard(
+                item.name,
+                `${Math.round(item.success_rate * 100)}% success`,
+                `Reliability ${item.reliability.toFixed(2)}`
+            );
+        });
+        if (!summaries.length) {
+            target.innerHTML = renderCard("No data", "Run agents", "Execute runs to populate insights.");
+        }
+    }
+
+    async function loadFailingTools() {
+        const response = await fetch("/insights/overview");
+        const target = document.getElementById("insight-tools");
+        if (!response.ok) {
+            target.innerHTML = renderCard("Failing tools", "Unavailable", "No insight feed.");
+            return;
+        }
+        const data = await response.json();
+        const tools = data.failing_tools || [];
+        if (!tools.length) {
+            target.innerHTML = renderCard("All tools healthy", "0 failing", "No recurring failures.");
+            return;
+        }
+        target.innerHTML = "";
+        tools.slice(0, 4).forEach((tool) => {
+            target.innerHTML += renderCard(
+                tool.tool,
+                `${Math.round((tool.success_rate || 0) * 100)}% success`,
+                `${tool.attempts} attempts`
+            );
+        });
+    }
+
+    async function loadCostInsights() {
+        const response = await fetch("/insights/overview");
+        const target = document.getElementById("insight-cost");
+        if (!response.ok) {
+            target.innerHTML = renderCard("Cost insights", "Unavailable", "No model data.");
+            return;
+        }
+        const data = await response.json();
+        const models = data.model_performance || [];
+        if (!models.length) {
+            target.innerHTML = renderCard("No model costs", "0", "Run agents to populate.");
+            return;
+        }
+        const sorted = [...models].sort((a, b) => (b.avg_cost_usd || 0) - (a.avg_cost_usd || 0));
+        target.innerHTML = "";
+        sorted.slice(0, 4).forEach((model) => {
+            target.innerHTML += renderCard(
+                model.model,
+                `$${(model.avg_cost_usd || 0).toFixed(4)} avg`,
+                `${Math.round((model.success_rate || 0) * 100)}% success`
+            );
+        });
+    }
+
+    loadOverview();
+    loadAgents();
+    loadFailingTools();
+    loadCostInsights();
+</script>
+{% endblock %}

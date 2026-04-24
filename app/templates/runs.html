@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% set title = "Runs" %}
+{% set subtitle = "Track every agent execution across your workspace." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/dashboard/agents">Back to agents</a>
+{% endblock %}
+{% block content %}
+<section class="card">
+    {% if runs and runs|length > 0 %}
+        <div class="runs-grid">
+            {% for run in runs %}
+            {% include "components/run_card.html" %}
+            {% endfor %}
+        </div>
+    {% else %}
+        <p class="muted">No runs yet. Trigger an agent and check back.</p>
+    {% endif %}
+</section>
+<script>
+    document.querySelectorAll("[data-inspect-run]").forEach((button) => {
+        button.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const runId = button.dataset.inspectRun;
+            const response = await fetch(`/runs/${runId}/timeline`);
+            if (!response.ok) {
+                return;
+            }
+            const payload = await response.json();
+            let insights = null;
+            if (payload.run?.agent_id) {
+                const insightResponse = await fetch(`/insights/agents/${payload.run.agent_id}`);
+                if (insightResponse.ok) {
+                    insights = await insightResponse.json();
+                }
+            }
+            const reasoningSummary = insights?.recommended_improvements?.[0]
+                || payload.run.summary_memory
+                || "Planner followed the request context and available tools.";
+            const toolScoring = (insights?.successful_patterns || [])
+                .slice(0, 3)
+                .map((item) => ({ tool: item.tool, score: (item.success_rate || 0.0).toFixed(2) }));
+            window.workspaceInspector.setRunContext({
+                run: payload.run,
+                steps: payload.steps || [],
+                reasoningSummary: reasoningSummary,
+                toolScoring: toolScoring,
+                decisionTrace: [],
+                suggestions: [],
+            });
+        });
+    });
+</script>
+{% endblock %}

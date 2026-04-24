@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% set title = "Welcome" %}
+{% set subtitle = "Let us set up your first agent." %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h1>Welcome to OpenClaw</h1>
+        <p>Launch your first agent in minutes. We will guide you through it.</p>
+    </div>
+    <div class="wizard-panel">
+        <div class="section-title">Step 1: Create your first agent</div>
+        <p class="muted">Use the guided builder to set up an agent for your workflow.</p>
+        <a class="btn" href="/agents/new">Start agent wizard</a>
+    </div>
+    <div class="wizard-panel">
+        <div class="section-title">Step 2: Run a demo</div>
+        <p class="muted">Once your agent is created, open chat and try a sample prompt.</p>
+        <a class="btn btn-secondary" href="/chat">Open chat</a>
+    </div>
+</section>
+{% endblock %}

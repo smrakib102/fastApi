@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import secrets
@@ -176,7 +177,15 @@ def admin_login_verify(
     redis_client.delete(f"admin:otp:{normalized_email}")
     redis_client.delete(f"admin:otp:attempts:{normalized_email}")
 
-    token = create_access_token(str(user.id))
+    try:
+        token = create_access_token(str(user.id))
+    except RuntimeError:
+        return templates.TemplateResponse(
+            "admin_login.html",
+            {"request": request, "error": "Auth service unavailable. Please try again."},
+            status_code=503,
+        )
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.auth_access_token_minutes)
     response = RedirectResponse("/admin/panel", status_code=303)
     response.set_cookie(
         key=settings.auth_cookie_name,
@@ -184,6 +193,8 @@ def admin_login_verify(
         httponly=True,
         samesite="lax",
         secure=settings.environment != "local",
+        max_age=settings.auth_access_token_minutes * 60,
+        expires=expires_at,
     )
     record_audit(db, user.id, "admin_otp_login", "user", str(user.id))
     return response

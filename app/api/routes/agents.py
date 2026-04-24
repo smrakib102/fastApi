@@ -11,6 +11,7 @@ from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
 from app.models.agent_run_step import AgentRunStep
+from app.models.agent_performance import AgentPerformance
 from app.models.user import User
 from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
 
@@ -52,6 +53,10 @@ def list_agents(
     if category:
         query = query.where(Agent.category == category)
     agents = db.execute(query).scalars().all()
+    perf_rows = db.execute(
+        select(AgentPerformance).where(AgentPerformance.user_id == current_user.id)
+    ).scalars().all()
+    perf_map = {row.agent_id: row for row in perf_rows}
     default_provider = get_default_provider(db)
     code_provider = get_code_provider(db)
     return {
@@ -64,6 +69,18 @@ def list_agents(
                 "tools": json.loads(agent.tools or "[]"),
                 "category": agent.category,
                 "status": agent.status,
+                "success_rate": float(perf_map.get(agent.id).success_rate)
+                if perf_map.get(agent.id)
+                else None,
+                "reliability_score": float(perf_map.get(agent.id).reliability_score)
+                if perf_map.get(agent.id)
+                else None,
+                "cost_efficiency": float(perf_map.get(agent.id).cost_efficiency)
+                if perf_map.get(agent.id)
+                else None,
+                "run_count": int(perf_map.get(agent.id).run_count)
+                if perf_map.get(agent.id)
+                else 0,
                 "resolved_provider": resolve_provider(
                     db,
                     current_user.id,
@@ -262,8 +279,11 @@ def list_agent_run_steps(
                 "tool_name": step.tool_name or content.get("tool_name"),
                 "input": input_value,
                 "output": output_value,
+                    "reasoning": _parse_json_field(step.reasoning_json) or content.get("reasoning"),
                 "status": step.status,
                 "content": step.content,
+                "tokens_used": step.tokens_used,
+                "cost_usd": step.cost_usd,
                 "created_at": step.created_at,
                 "updated_at": step.updated_at,
             }

@@ -1,0 +1,29 @@
+<div class="run-header">
+    <div class="card-header">
+        <h1>Run #{{ run.id }}</h1>
+        <p>{{ agent_name or "Unknown agent" }}</p>
+    </div>
+</div>
+
+<div class="run-summary">
+    <div>
+        <div class="run-label">Status</div>
+        <div id="run-status" class="status-pill status-{{ run.status }}">{{ run.status }}</div>
+    </div>
+    <div>
+        <div class="run-label">Created</div>
+        <div class="run-value">{{ run.created_at }}</div>
+    </div>
+    <div>
+        <div class="run-label">Updated</div>
+        <div id="run-updated" class="run-value">{{ run.updated_at }}</div>
+    </div>
+    <div>
+        <div class="run-label">Started</div>
+        <div id="run-started" class="run-value">{{ run.started_at or "-" }}</div>
+    </div>
+    <div>
+        <div class="run-label">Finished</div>
+        <div id="run-finished" class="run-value">{{ run.finished_at or "-" }}</div>
+    </div>
+</div>

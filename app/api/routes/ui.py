@@ -2,10 +2,10 @@ from pathlib import Path
 
 import json
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
@@ -14,6 +14,8 @@ from app.core.crypto import encrypt_value
 from app.core.model_routing import resolve_provider
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
+from app.models.agent_run_step import AgentRunStep
+from app.models.agent_performance import AgentPerformance
 from app.models.team_agent import TeamAgent
 from app.models.user_profile import UserProfile
 from app.models.team import Team
@@ -35,10 +37,58 @@ def root(request: Request, current_user: User | None = Depends(get_current_user)
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request, current_user: User | None = Depends(get_current_user)):
+def dashboard(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
-    return RedirectResponse("/dashboard/agents", status_code=303)
+
+    agent_count = db.execute(
+        select(func.count(Agent.id)).where(Agent.user_id == current_user.id)
+    ).scalar()
+    if not agent_count:
+        return RedirectResponse("/onboarding", status_code=303)
+
+    latest_runs = db.execute(
+        select(AgentRun)
+        .where(AgentRun.user_id == current_user.id)
+        .order_by(AgentRun.created_at.desc())
+        .limit(6)
+    ).scalars().all()
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "user": current_user,
+            "latest_runs": latest_runs,
+        },
+    )
+
+
+@router.get("/insights", response_class=HTMLResponse)
+def insights_dashboard(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    agents = db.execute(
+        select(Agent).where(Agent.user_id == current_user.id).order_by(Agent.created_at.desc())
+    ).scalars().all()
+
+    return templates.TemplateResponse(
+        "insights.html",
+        {
+            "request": request,
+            "user": current_user,
+            "agents": agents,
+        },
+    )
 
 
 @router.get("/dashboard/agents", response_class=HTMLResponse)
@@ -53,6 +103,11 @@ def dashboard_agents(
     agents = db.execute(
         select(Agent).where(Agent.user_id == current_user.id).order_by(Agent.created_at.desc())
     ).scalars().all()
+
+    perf_rows = db.execute(
+        select(AgentPerformance).where(AgentPerformance.user_id == current_user.id)
+    ).scalars().all()
+    perf_map = {row.agent_id: row for row in perf_rows}
 
     teams = db.execute(
         select(Team).where(Team.user_id == current_user.id).order_by(Team.created_at.desc())
@@ -72,23 +127,12 @@ def dashboard_agents(
             if agent:
                 team_map[mapping.team_id].append(agent)
 
-    keys = db.execute(
-        select(UserProfile).where(
-            UserProfile.user_id == current_user.id,
-            UserProfile.key.in_(["openai_api_key", "gemini_api_key"]),
-        )
-    ).scalars().all()
-    key_map = {item.key: item.value for item in keys}
-
     latest_runs = db.execute(
         select(AgentRun)
         .where(AgentRun.user_id == current_user.id)
         .order_by(AgentRun.created_at.desc())
+        .limit(12)
     ).scalars().all()
-    run_map: dict[int, AgentRun] = {}
-    for run in latest_runs:
-        if run.agent_id not in run_map:
-            run_map[run.agent_id] = run
 
     default_provider = get_default_provider(db)
     code_provider = get_code_provider(db)
@@ -106,15 +150,15 @@ def dashboard_agents(
             agent.resolved_provider = None
 
     return templates.TemplateResponse(
-        "dashboard.html",
+        "agents.html",
         {
             "request": request,
             "user": current_user,
             "agents": agents,
+            "agent_perf": perf_map,
             "teams": teams,
             "team_agents": team_map,
-            "key_map": key_map,
-            "run_map": run_map,
+            "latest_runs": latest_runs,
         },
     )
 
@@ -262,3 +306,185 @@ def dashboard_run_agent(
         return RedirectResponse("/dashboard/agents?error=runtime", status_code=303)
 
     return RedirectResponse("/dashboard/agents", status_code=303)
+
+
+@router.get("/chat", response_class=HTMLResponse)
+def chat_page(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+    return templates.TemplateResponse(
+        "chat.html",
+        {
+            "request": request,
+            "user": current_user,
+        },
+    )
+
+
+@router.get("/agents/new", response_class=HTMLResponse)
+def agent_builder(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+    return templates.TemplateResponse(
+        "agents_new.html",
+        {
+            "request": request,
+            "user": current_user,
+        },
+    )
+
+
+@router.get("/tools", response_class=HTMLResponse)
+def tools_page(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+    return templates.TemplateResponse(
+        "tools.html",
+        {
+            "request": request,
+            "user": current_user,
+        },
+    )
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    keys = db.execute(
+        select(UserProfile).where(
+            UserProfile.user_id == current_user.id,
+            UserProfile.key.in_(["openai_api_key", "gemini_api_key"]),
+        )
+    ).scalars().all()
+    key_map = {item.key: item.value for item in keys}
+
+    return templates.TemplateResponse(
+        "settings.html",
+        {
+            "request": request,
+            "user": current_user,
+            "key_map": key_map,
+        },
+    )
+
+
+@router.get("/onboarding", response_class=HTMLResponse)
+def onboarding_page(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+    agent_count = db.execute(
+        select(func.count(Agent.id)).where(Agent.user_id == current_user.id)
+    ).scalar()
+    if agent_count:
+        return RedirectResponse("/dashboard", status_code=303)
+    return templates.TemplateResponse(
+        "onboarding.html",
+        {
+            "request": request,
+            "user": current_user,
+        },
+    )
+
+
+@router.get("/dashboard/runs", response_class=HTMLResponse)
+def dashboard_runs(
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    rows = db.execute(
+        select(AgentRun, Agent.name)
+        .join(Agent, Agent.id == AgentRun.agent_id, isouter=True)
+        .where(AgentRun.user_id == current_user.id)
+        .order_by(AgentRun.created_at.desc())
+        .limit(200)
+    ).all()
+
+    run_ids = [row[0].id for row in rows]
+    step_counts: dict[int, int] = {}
+    if run_ids:
+        counts = db.execute(
+            select(AgentRunStep.run_id, func.count(AgentRunStep.id))
+            .where(AgentRunStep.run_id.in_(run_ids))
+            .group_by(AgentRunStep.run_id)
+        ).all()
+        step_counts = {run_id: count for run_id, count in counts}
+
+    runs = []
+    for run, agent_name in rows:
+        runs.append(
+            {
+                "id": run.id,
+                "agent_id": run.agent_id,
+                "agent_name": agent_name,
+                "status": run.status,
+                "input_text": run.input_text,
+                "output_text": run.output_text,
+                "error_message": run.error_message,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+                "steps": step_counts.get(run.id, 0),
+            }
+        )
+
+    return templates.TemplateResponse(
+        "runs.html",
+        {
+            "request": request,
+            "user": current_user,
+            "runs": runs,
+        },
+    )
+
+
+@router.get("/dashboard/runs/{run_id}", response_class=HTMLResponse)
+def dashboard_run_detail(
+    run_id: int,
+    request: Request,
+    current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        return RedirectResponse("/auth/login", status_code=303)
+
+    row = db.execute(
+        select(AgentRun, Agent.name)
+        .join(Agent, Agent.id == AgentRun.agent_id, isouter=True)
+        .where(AgentRun.id == run_id, AgentRun.user_id == current_user.id)
+    ).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run, agent_name = row
+    return templates.TemplateResponse(
+        "run_detail.html",
+        {
+            "request": request,
+            "user": current_user,
+            "run": run,
+            "agent_name": agent_name,
+        },
+    )

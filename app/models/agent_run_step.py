@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.sql import func
 
 from app.db.base import Base
@@ -18,7 +18,10 @@ class AgentRunStep(Base):
     tool_name = Column(String(120), nullable=True)
     input_json = Column(Text, nullable=True)
     output_json = Column(Text, nullable=True)
+    tokens_used = Column(Integer, nullable=True)
+    cost_usd = Column(Float, nullable=True)
     content = Column(Text, nullable=True)
+    reasoning_json = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

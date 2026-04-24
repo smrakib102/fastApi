@@ -1,5 +1,8 @@
 import json
+import logging
+import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -7,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_legacy_user, require_user
+from app.api.deps import get_db, require_user
 from app.core.config import settings
 from app.core.redis_client import get_redis
 from app.models.employee import Employee
@@ -25,6 +28,12 @@ from app.models.agent import Agent
 from app.services.audit_log import record_audit
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+_rate_window_seconds = 10
+_rate_limit_max = 5
+_max_text_length = 1200
 
 
 def _extract_message(update: dict) -> dict | None:
@@ -75,8 +84,48 @@ def _extract_run(text: str | None) -> tuple[str, str | None] | None:
     if len(parts) < 2:
         return None
     agent_ref = parts[1].strip()
+    if len(agent_ref) > 80 or not re.fullmatch(r"[a-zA-Z0-9._-]+", agent_ref):
+        return None
     prompt = parts[2].strip() if len(parts) > 2 else None
     return agent_ref, prompt
+
+
+def _enforce_rate_limit(chat_id: str, telegram_user_id: str) -> None:
+    redis_client = get_redis()
+    chat_key = f"telegram:rate:chat:{chat_id}"
+    user_key = f"telegram:rate:user:{telegram_user_id}"
+
+    chat_count = redis_client.incr(chat_key)
+    user_count = redis_client.incr(user_key)
+
+    if chat_count == 1:
+        redis_client.expire(chat_key, _rate_window_seconds)
+    if user_count == 1:
+        redis_client.expire(user_key, _rate_window_seconds)
+
+    if chat_count > _rate_limit_max or user_count > _rate_limit_max:
+        logger.warning("telegram_rate_limited", extra={"chat_id": chat_id, "telegram_user_id": telegram_user_id})
+        raise HTTPException(status_code=429, detail="Rate limited")
+
+
+def _validate_text(text: str | None) -> None:
+    if text and len(text) > _max_text_length:
+        logger.warning("telegram_message_rejected", extra={"reason": "message_too_long"})
+        raise HTTPException(status_code=400, detail="Message too long")
+
+
+def _extract_confirm_token(text: str | None) -> str | None:
+    if not text:
+        return None
+    if not text.upper().startswith("CONFIRM "):
+        return None
+    return text.split(" ", 1)[1].strip()
+
+
+def _dedupe_update(update_id: int) -> bool:
+    redis_client = get_redis()
+    key = f"telegram:update:{update_id}"
+    return bool(redis_client.set(key, "1", ex=300, nx=True))
 
 
 def _is_summary_now(text: str | None) -> bool:
@@ -173,9 +222,24 @@ def telegram_webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if settings.telegram_webhook_secret:
-        if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not settings.telegram_webhook_secret:
+        logger.error("telegram_webhook_rejected", extra={"reason": "missing_secret"})
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not x_telegram_bot_api_secret_token:
+        logger.warning("telegram_webhook_rejected", extra={"reason": "missing_header"})
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        logger.warning("telegram_webhook_rejected", extra={"reason": "invalid_secret"})
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    update_id = update.get("update_id")
+    if isinstance(update_id, int):
+        if not _dedupe_update(update_id):
+            logger.warning("telegram_duplicate_update", extra={"update_id": update_id})
+            return {"ok": True}
+    else:
+        logger.warning("telegram_update_invalid", extra={"reason": "missing_update_id"})
+        return {"ok": True}
 
     callback = _extract_callback(update)
     message = _extract_message(update)
@@ -186,9 +250,13 @@ def telegram_webhook(
         data = callback.get("data") or ""
         callback_id = callback.get("id")
         from_user = callback.get("from", {})
+        telegram_user_id = str(from_user.get("id") or "")
         chat = callback.get("message", {}).get("chat", {})
         chat_id = chat.get("id")
         if not chat_id:
+            return {"ok": True}
+        if not telegram_user_id:
+            logger.warning("telegram_user_missing", extra={"chat_id": str(chat_id)})
             return {"ok": True}
 
         parts = data.split(":", 2)
@@ -200,7 +268,7 @@ def telegram_webhook(
         action = parts[1]
         request_id = parts[2]
         link = db.execute(
-            select(TelegramLink).where(TelegramLink.telegram_user_id == str(chat_id))
+            select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
         ).scalar_one_or_none()
         user_id = link.user_id if link else None
         if not user_id:
@@ -271,13 +339,23 @@ def telegram_webhook(
     if not chat_id:
         return {"ok": True}
 
+    from_user = message.get("from", {})
+    telegram_user_id = str(from_user.get("id") or "")
+    if not telegram_user_id:
+        logger.warning("telegram_user_missing", extra={"chat_id": str(chat_id)})
+        return {"ok": True}
+
+    _enforce_rate_limit(str(chat_id), telegram_user_id)
+
     name = _build_display_name(message)
     text = message.get("text")
+    _validate_text(text)
     start_token = _extract_start_token(text)
     setkey = _extract_setkey(text)
     run_request = _extract_run(text)
     summary_now = _is_summary_now(text)
     new_agent = _is_new_agent(text)
+    confirm_token = _extract_confirm_token(text)
 
     linked_user_id: int | None = None
     if start_token:
@@ -288,7 +366,7 @@ def telegram_webhook(
             redis_client.delete(f"telegram:link:{start_token}")
 
             existing_link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == str(chat_id))
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
             ).scalar_one_or_none()
             if existing_link:
                 existing_link.user_id = linked_user_id
@@ -297,7 +375,7 @@ def telegram_webhook(
                 db.add(
                     TelegramLink(
                         user_id=linked_user_id,
-                        telegram_user_id=str(chat_id),
+                        telegram_user_id=telegram_user_id,
                         display_name=name,
                     )
                 )
@@ -305,24 +383,33 @@ def telegram_webhook(
     existing = db.execute(
         select(Employee).where(Employee.telegram_chat_id == str(chat_id))
     ).scalar_one_or_none()
-
-    legacy_user = get_legacy_user(db)
     if existing:
         existing.name = name
         if linked_user_id:
             existing.user_id = linked_user_id
-        elif not existing.user_id:
-            existing.user_id = legacy_user.id
     else:
         db.add(
             Employee(
                 name=name,
                 telegram_chat_id=str(chat_id),
-                user_id=linked_user_id or legacy_user.id,
+                user_id=linked_user_id,
             )
         )
-
     db.commit()
+
+    link = db.execute(
+        select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+    ).scalar_one_or_none()
+    if link:
+        linked_user_id = link.user_id
+
+    if not linked_user_id:
+        logger.warning("telegram_unlinked_block", extra={"chat_id": str(chat_id)})
+        if start_token:
+            _send_message(db, chat_id, "Account linked. You can now use bot commands.")
+        else:
+            _send_message(db, chat_id, "Please link your account first via the dashboard.")
+        return {"ok": True}
 
     pending_raw = get_redis().get(f"telegram:pending:{chat_id}")
     if pending_raw and text and not text.startswith("/"):
@@ -362,35 +449,9 @@ def telegram_webhook(
             return {"ok": True}
 
     if setkey:
-        tool_name, api_key = setkey
-        user_id = linked_user_id or (existing.user_id if existing else legacy_user.id)
-        tool = db.execute(
-            select(ToolRegistry).where(ToolRegistry.name == tool_name)
-        ).scalar_one_or_none()
-        if tool:
-            db.add(ToolCredential(user_id=user_id, tool_id=tool.id, secret=encrypt_value(api_key)))
-            record_audit(
-                db,
-                user_id,
-                "set_tool_key",
-                "tool_credential",
-                str(tool.id),
-                {"tool_name": tool.name, "source": "telegram"},
-            )
-            req = db.execute(
-                select(ToolRequest)
-                .where(ToolRequest.user_id == user_id, ToolRequest.tool_name == tool_name)
-                .order_by(ToolRequest.created_at.desc())
-            ).scalar_one_or_none()
-            if req:
-                req.status = "resolved"
-            db.commit()
-
-            _send_message(
-                db,
-                chat_id,
-                f"Saved key for <code>{tool_name}</code>. You can continue now.",
-            )
+        logger.warning("telegram_command_blocked", extra={"command": "/setkey", "chat_id": str(chat_id)})
+        _send_message(db, chat_id, "This command is disabled. Use the dashboard to manage keys.")
+        return {"ok": True}
 
     chat_type = chat.get("type") or "unknown"
     sender = message.get("from") or {}
@@ -400,7 +461,7 @@ def telegram_webhook(
 
     db.add(
         TelegramMessage(
-            user_id=linked_user_id or (existing.user_id if existing else legacy_user.id),
+            user_id=linked_user_id,
             chat_id=str(chat_id),
             chat_type=chat_type,
             message_id=str(message.get("message_id") or ""),
@@ -415,7 +476,7 @@ def telegram_webhook(
 
     if run_request:
         agent_ref, prompt = run_request
-        user_id = linked_user_id or (existing.user_id if existing else legacy_user.id)
+        user_id = linked_user_id
         agent = None
         if agent_ref.isdigit():
             agent = db.execute(
@@ -445,7 +506,7 @@ def telegram_webhook(
 
             summary = generate_summary(
                 db,
-                linked_user_id or (existing.user_id if existing else legacy_user.id),
+                linked_user_id,
                 str(chat_id),
                 "UTC",
             )
@@ -454,7 +515,38 @@ def telegram_webhook(
             _send_message(db, chat_id, f"Summary failed: {exc}")
         return {"ok": True}
 
+    if confirm_token:
+        stored = get_redis().get(f"telegram:confirm:{chat_id}:{confirm_token}")
+        if not stored:
+            logger.warning("telegram_confirm_rejected", extra={"chat_id": str(chat_id)})
+            _send_message(db, chat_id, "Confirmation token expired or invalid.")
+            return {"ok": True}
+        payload = json.loads(stored)
+        stored_user_id = int(payload.get("user_id") or 0)
+        stored_chat_id = str(payload.get("chat_id") or "")
+        stored_action = payload.get("action") or ""
+        if stored_user_id != linked_user_id or stored_chat_id != str(chat_id) or stored_action != "newagent":
+            logger.warning("telegram_confirm_rejected", extra={"chat_id": str(chat_id), "reason": "user_mismatch"})
+            _send_message(db, chat_id, "Confirmation token invalid.")
+            return {"ok": True}
+        get_redis().delete(f"telegram:confirm:{chat_id}:{confirm_token}")
+        new_agent = True
+
     if new_agent:
+        if not confirm_token:
+            confirm_value = secrets.token_urlsafe(12)
+            confirm_payload = {
+                "user_id": linked_user_id,
+                "chat_id": str(chat_id),
+                "action": "newagent",
+            }
+            get_redis().setex(
+                f"telegram:confirm:{chat_id}:{confirm_value}",
+                120,
+                json.dumps(confirm_payload),
+            )
+            _send_message(db, chat_id, f"Reply CONFIRM {confirm_value} to start agent creation.")
+            return {"ok": True}
         templates = db.execute(select(AgentTemplate)).scalars().all()
         if not templates:
             _send_message(db, chat_id, "No templates available yet.")
@@ -475,7 +567,7 @@ def telegram_webhook(
     if pending_template_raw and text and not text.startswith("/"):
         pending = json.loads(pending_template_raw)
         stage = pending.get("stage")
-        user_id = linked_user_id or (existing.user_id if existing else legacy_user.id)
+        user_id = linked_user_id
 
         if stage == "choose":
             template = None

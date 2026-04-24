@@ -1,0 +1,9 @@
+<div class="run-output-panel">
+    <div class="run-label">Output</div>
+    <pre id="run-output" class="run-output">{{ run.output_text or "" }}</pre>
+    {% if run.error_message %}
+        <div id="run-error" class="run-error">{{ run.error_message }}</div>
+    {% else %}
+        <div id="run-error" class="run-error hidden"></div>
+    {% endif %}
+</div>

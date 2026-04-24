@@ -1,0 +1,227 @@
+{% extends "base.html" %}
+{% set title = "Agent Builder" %}
+{% set subtitle = "Create a new agent with guided steps." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/dashboard/agents">Back to agents</a>
+{% endblock %}
+{% block content %}
+<section class="wizard">
+    <div class="wizard-steps">
+        <span class="wizard-step active" data-step="1">1. Mission</span>
+        <span class="wizard-step" data-step="2">2. Tools</span>
+        <span class="wizard-step" data-step="3">3. Model</span>
+        <span class="wizard-step" data-step="4">4. Confirm</span>
+    </div>
+
+    <div class="wizard-panel" id="wizard-panel">
+        <div class="section-title">What should your agent do?</div>
+        <input id="agent-mission" type="text" placeholder="e.g. Summarize sales calls and follow up via email" />
+
+        <div class="section-title">Choose a template</div>
+        <div class="template-grid" id="template-grid"></div>
+
+        <button class="btn" id="wizard-next">Next</button>
+    </div>
+</section>
+
+<script>
+    const templates = [
+        {
+            id: "research",
+            name: "Research agent",
+            description: "Synthesize information and craft insights.",
+            tools: ["gmail.list_messages", "calendar.list"],
+            role: "Research assistant",
+            category: "general",
+        },
+        {
+            id: "email",
+            name: "Email assistant",
+            description: "Draft and manage inbox actions.",
+            tools: ["gmail.list_messages", "gmail.draft"],
+            role: "Email assistant",
+            category: "communications",
+        },
+        {
+            id: "telegram",
+            name: "Telegram assistant",
+            description: "Responds and notifies through Telegram.",
+            tools: [],
+            role: "Telegram assistant",
+            category: "ops",
+        },
+        {
+            id: "automation",
+            name: "Automation agent",
+            description: "Runs multi-step workflows safely.",
+            tools: ["calendar.list", "gmail.draft"],
+            role: "Automation specialist",
+            category: "automation",
+        },
+    ];
+
+    const wizardSteps = document.querySelectorAll(".wizard-step");
+    const panel = document.getElementById("wizard-panel");
+    const missionInput = document.getElementById("agent-mission");
+    const templateGrid = document.getElementById("template-grid");
+    const nextButton = document.getElementById("wizard-next");
+
+    let currentStep = 1;
+    let selectedTemplate = templates[0];
+    let suggestedTools = [...selectedTemplate.tools];
+    let selectedModel = "auto";
+
+    function renderTemplates() {
+        templateGrid.innerHTML = "";
+        templates.forEach((template) => {
+            const card = document.createElement("div");
+            card.className = "template-card";
+            if (template.id === selectedTemplate.id) {
+                card.classList.add("active");
+            }
+            card.innerHTML = `
+                <div class="panel-title">${template.name}</div>
+                <div class="muted">${template.description}</div>
+                <div class="tag-row">${template.tools.map((tool) => `<span class="tag tool-pill">${tool}</span>`).join("")}</div>
+            `;
+            card.addEventListener("click", () => {
+                selectedTemplate = template;
+                suggestedTools = [...template.tools];
+                renderTemplates();
+            });
+            templateGrid.appendChild(card);
+        });
+    }
+
+    function updateSteps() {
+        wizardSteps.forEach((step) => {
+            step.classList.toggle("active", Number(step.dataset.step) === currentStep);
+        });
+    }
+
+    function renderStep() {
+        updateSteps();
+        if (currentStep === 1) {
+            panel.innerHTML = `
+                <div class="section-title">What should your agent do?</div>
+                <input id="agent-mission" type="text" placeholder="e.g. Summarize sales calls and follow up via email" />
+                <div class="section-title">Choose a template</div>
+                <div class="template-grid" id="template-grid"></div>
+                <button class="btn" id="wizard-next">Next</button>
+            `;
+            panel.querySelector("#agent-mission").value = missionInput.value;
+            panel.querySelector("#wizard-next").addEventListener("click", () => {
+                currentStep = 2;
+                renderStep();
+            });
+            const newTemplateGrid = panel.querySelector("#template-grid");
+            templates.forEach((template) => {
+                const card = document.createElement("div");
+                card.className = "template-card";
+                if (template.id === selectedTemplate.id) {
+                    card.classList.add("active");
+                }
+                card.innerHTML = `
+                    <div class="panel-title">${template.name}</div>
+                    <div class="muted">${template.description}</div>
+                    <div class="tag-row">${template.tools.map((tool) => `<span class="tag tool-pill">${tool}</span>`).join("")}</div>
+                `;
+                card.addEventListener("click", () => {
+                    selectedTemplate = template;
+                    suggestedTools = [...template.tools];
+                    renderStep();
+                });
+                newTemplateGrid.appendChild(card);
+            });
+        }
+
+        if (currentStep === 2) {
+            panel.innerHTML = `
+                <div class="section-title">Suggested tools</div>
+                <div class="tag-row" id="tool-list"></div>
+                <div class="muted">You can adjust tools later.</div>
+                <button class="btn" id="wizard-next">Next</button>
+            `;
+            const toolList = panel.querySelector("#tool-list");
+            suggestedTools.forEach((tool) => {
+                const tag = document.createElement("span");
+                tag.className = "tag tool-pill";
+                tag.textContent = tool;
+                toolList.appendChild(tag);
+            });
+            panel.querySelector("#wizard-next").addEventListener("click", () => {
+                currentStep = 3;
+                renderStep();
+            });
+        }
+
+        if (currentStep === 3) {
+            panel.innerHTML = `
+                <div class="section-title">Choose model</div>
+                <div class="template-grid">
+                    <div class="template-card" data-model="auto">
+                        <div class="panel-title">Auto (recommended)</div>
+                        <div class="muted">Let the system select the best provider.</div>
+                    </div>
+                    <div class="template-card" data-model="gpt-4o-mini">
+                        <div class="panel-title">OpenAI GPT</div>
+                        <div class="muted">Fast, high quality for chat workflows.</div>
+                    </div>
+                    <div class="template-card" data-model="gemini-1.5-flash">
+                        <div class="panel-title">Gemini Flash</div>
+                        <div class="muted">Lightweight for quick tasks.</div>
+                    </div>
+                </div>
+                <button class="btn" id="wizard-next">Next</button>
+            `;
+            panel.querySelectorAll(".template-card").forEach((card) => {
+                if (card.dataset.model === selectedModel) {
+                    card.classList.add("active");
+                }
+                card.addEventListener("click", () => {
+                    selectedModel = card.dataset.model;
+                    renderStep();
+                });
+            });
+            panel.querySelector("#wizard-next").addEventListener("click", () => {
+                currentStep = 4;
+                renderStep();
+            });
+        }
+
+        if (currentStep === 4) {
+            panel.innerHTML = `
+                <div class="section-title">Confirm your agent</div>
+                <div class="panel-card">
+                    <div class="panel-title">${selectedTemplate.name}</div>
+                    <div class="muted">${selectedTemplate.description}</div>
+                    <div><strong>Mission:</strong> ${missionInput.value || selectedTemplate.role}</div>
+                    <div class="tag-row">${suggestedTools.map((tool) => `<span class="tag tool-pill">${tool}</span>`).join("")}</div>
+                    <div class="tag-row"><span class="tag">Model: ${selectedModel}</span></div>
+                </div>
+                <button class="btn" id="wizard-create">Create agent</button>
+            `;
+            panel.querySelector("#wizard-create").addEventListener("click", async () => {
+                const payload = {
+                    name: `${selectedTemplate.name} ${Date.now().toString().slice(-4)}`,
+                    role: missionInput.value || selectedTemplate.role,
+                    model: selectedModel,
+                    tools: suggestedTools,
+                    category: selectedTemplate.category,
+                };
+                const response = await fetch("/agents", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (response.ok) {
+                    window.location.href = "/dashboard/agents";
+                }
+            });
+        }
+    }
+
+    renderTemplates();
+    renderStep();
+</script>
+{% endblock %}

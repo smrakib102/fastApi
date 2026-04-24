@@ -1,0 +1,657 @@
+{% extends "base.html" %}
+{% set title = "Run Details" %}
+{% set subtitle = "Inspect every step and output in real time." %}
+{% block header_actions %}
+<a class="btn btn-secondary" href="/dashboard/runs">Back to runs</a>
+{% endblock %}
+{% block right_panel %}
+<div class="inspector-card" id="inspector-content">
+    <div class="inspector-title">Run summary</div>
+    <div class="card-section">
+        <div class="run-label">Status</div>
+        <div class="status-pill status-{{ run.status }}">{{ run.status }}</div>
+    </div>
+    <div class="card-section">
+        <div class="run-label">Tokens</div>
+        <div class="run-value">{{ run.total_tokens or 0 }}</div>
+    </div>
+    <div class="card-section">
+        <div class="run-label">Cost</div>
+        <div class="run-value">${{ "%.4f" | format(run.total_cost_usd or 0) }}</div>
+    </div>
+    {% if run.summary_memory %}
+    <div class="card-section">
+        <div class="run-label">Summary memory</div>
+        <div class="muted">{{ run.summary_memory }}</div>
+    </div>
+    {% endif %}
+</div>
+<div class="inspector-card explain-card" id="run-explanation">
+    <div class="inspector-title">Run explanation</div>
+    <div class="card-section">
+        <div class="run-label">Why this plan</div>
+        <div class="muted" id="explain-plan">Loading plan rationale...</div>
+    </div>
+    <div class="card-section">
+        <div class="run-label">Why this tool</div>
+        <div class="muted" id="explain-tool">Waiting for tool selection details...</div>
+    </div>
+    <div class="card-section">
+        <div class="run-label">Fallbacks & retries</div>
+        <div class="muted" id="explain-fallback">No retries detected yet.</div>
+    </div>
+    <div class="card-section">
+        <div class="run-label">Decision trace</div>
+        <ul class="trace-list" id="explain-trace"></ul>
+    </div>
+</div>
+{% endblock %}
+{% block content %}
+<section class="card run-detail">
+    {% include "components/run_header.html" %}
+    {% include "components/run_output.html" %}
+
+    <div class="timeline-toolbar">
+        <div class="timeline-filters" role="group" aria-label="Timeline filter">
+            <button class="filter-btn active" data-filter="all" type="button">All steps</button>
+            <button class="filter-btn" data-filter="tool" type="button">Tool calls</button>
+            <button class="filter-btn" data-filter="error" type="button">Errors</button>
+        </div>
+        <div class="timeline-meta" id="timeline-status">Live polling</div>
+    </div>
+
+    <div class="timeline" id="timeline">
+        <div class="muted">Loading timeline...</div>
+    </div>
+
+</section>
+
+<script>
+    const runId = {{ run.id }};
+    const agentId = {{ run.agent_id }};
+    const timelineEl = document.getElementById("timeline");
+    const statusEl = document.getElementById("run-status");
+    const updatedEl = document.getElementById("run-updated");
+    const startedEl = document.getElementById("run-started");
+    const finishedEl = document.getElementById("run-finished");
+    const outputEl = document.getElementById("run-output");
+    const errorEl = document.getElementById("run-error");
+    const timelineStatusEl = document.getElementById("timeline-status");
+    const explainPlanEl = document.getElementById("explain-plan");
+    const explainToolEl = document.getElementById("explain-tool");
+    const explainFallbackEl = document.getElementById("explain-fallback");
+    const explainTraceEl = document.getElementById("explain-trace");
+    const filterButtons = document.querySelectorAll(".filter-btn");
+    let latestStep = 0;
+    let pollDelay = 2000;
+    let isPolling = true;
+    let currentFilter = "all";
+    let cachedSteps = [];
+    let agentInsights = null;
+
+    const statusClassMap = {
+        pending: "status-pending",
+        running: "status-running",
+        completed: "status-completed",
+        success: "status-success",
+        error: "status-error",
+        failed: "status-failed",
+        retry: "status-retry",
+    };
+
+    const icons = {
+        thinking: "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M9.5 2c-3.04 0-5.5 2.46-5.5 5.5 0 1.8.88 3.5 2.36 4.53l.64.45V15c0 .55.45 1 1 1h7c.55 0 1-.45 1-1v-2.52l.63-.45A5.48 5.48 0 0 0 20 7.5C20 4.46 17.54 2 14.5 2c-1.5 0-2.86.6-3.85 1.57A5.4 5.4 0 0 0 9.5 2zM8 17h8v2H8zm1 3h6v2H9z\"/></svg>",
+        tool: "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M22 19.6 13.35 11a5.5 5.5 0 0 0-7.42-7.42l3.3 3.3-2.12 2.12-3.3-3.3A5.5 5.5 0 0 0 11 10.65L19.6 19.3a1.7 1.7 0 0 0 2.4 0 1.7 1.7 0 0 0 0-2.4z\"/></svg>",
+        result: "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z\"/></svg>",
+        error: "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z\"/></svg>",
+        retry: "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 6V3L8 7l4 4V8c2.76 0 5 2.24 5 5a5 5 0 0 1-8.66 3.54l-1.42 1.42A7 7 0 0 0 19 13c0-3.87-3.13-7-7-7z\"/></svg>",
+    };
+
+    const cacheKey = `run_timeline_${runId}`;
+
+    function normalizeStatus(status) {
+        if (!status) {
+            return "pending";
+        }
+        return status.toLowerCase();
+    }
+
+    function formatTime(value) {
+        if (!value) {
+            return "-";
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toLocaleString();
+    }
+
+    function escapeHtml(value) {
+        return value
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/\"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function formatJson(value) {
+        if (value === null || value === undefined) {
+            return "";
+        }
+        if (typeof value === "string") {
+            try {
+                const parsed = JSON.parse(value);
+                return JSON.stringify(parsed, null, 2);
+            } catch (err) {
+                return value;
+            }
+        }
+        return JSON.stringify(value, null, 2);
+    }
+
+    function syntaxHighlight(jsonText) {
+        const escaped = escapeHtml(jsonText);
+        return escaped.replace(
+            /(\"(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\\"])*\"\s*:?)|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g,
+            (match) => {
+                if (match.startsWith("\"")) {
+                    if (match.endsWith(":")) {
+                        return `<span class=\"json-key\">${match}</span>`;
+                    }
+                    return `<span class=\"json-string\">${match}</span>`;
+                }
+                if (match === "true" || match === "false") {
+                    return `<span class=\"json-boolean\">${match}</span>`;
+                }
+                if (match === "null") {
+                    return `<span class=\"json-null\">${match}</span>`;
+                }
+                return `<span class=\"json-number\">${match}</span>`;
+            }
+        );
+    }
+
+    function detectStepType(step) {
+        const actionType = (step.action_type || step.kind || "").toLowerCase();
+        const status = normalizeStatus(step.status || "");
+        if (status === "retry" || actionType.includes("retry")) {
+            return "retry";
+        }
+        if (status === "error" || status === "failed") {
+            return "error";
+        }
+        if (step.tool_name || actionType.includes("tool")) {
+            return "tool";
+        }
+        if (step.output) {
+            return "result";
+        }
+        if (actionType.includes("plan") || actionType.includes("thought")) {
+            return "thinking";
+        }
+        return "thinking";
+    }
+
+    function renderJsonBlock(title, value) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "timeline-json";
+
+        const label = document.createElement("div");
+        label.className = "timeline-section-title";
+        label.textContent = title;
+
+        const pre = document.createElement("pre");
+        const raw = formatJson(value);
+        pre.innerHTML = syntaxHighlight(raw);
+
+        wrapper.appendChild(label);
+        wrapper.appendChild(pre);
+        return wrapper;
+    }
+
+    function buildToolScoreMap(insights) {
+        const scores = new Map();
+        if (!insights) {
+            return scores;
+        }
+        (insights.successful_patterns || []).forEach((item) => {
+            if (item.tool) {
+                scores.set(item.tool, 0.75);
+            }
+        });
+        (insights.failing_tools || []).forEach((item) => {
+            if (item.tool) {
+                scores.set(item.tool, 0.35);
+            }
+        });
+        return scores;
+    }
+
+    function rankCandidateTools(candidates, insights) {
+        const baseScores = buildToolScoreMap(insights);
+        return (candidates || [])
+            .map((tool) => {
+                const score = baseScores.has(tool) ? baseScores.get(tool) : 0.5;
+                return { tool, score: score.toFixed(2) };
+            })
+            .sort((a, b) => parseFloat(b.score) - parseFloat(a.score));
+    }
+
+    function extractPlanCandidates(steps) {
+        const map = new Map();
+        steps.forEach((step) => {
+            if (step.action_type === "plan" && step.output?.steps) {
+                step.output.steps.forEach((item) => {
+                    const tools = Array.isArray(item.tool)
+                        ? item.tool
+                        : item.tool
+                            ? [item.tool]
+                            : [];
+                    if (item.step) {
+                        map.set(item.step, tools);
+                    }
+                });
+            }
+        });
+        return map;
+    }
+
+    function attachTransparency(steps, insights) {
+        const candidateMap = extractPlanCandidates(steps);
+        steps.forEach((step) => {
+            if (!step.tool_name) {
+                return;
+            }
+            const candidates = candidateMap.get(step.step_number) || candidateMap.get(step.step_index) || [];
+            const list = candidates.length ? candidates : [step.tool_name];
+            const ranked = rankCandidateTools(list, insights);
+            step.explain = {
+                candidates: list,
+                ranked: ranked,
+                selected: step.tool_name,
+            };
+        });
+    }
+
+    function updateExplanationPanel(steps, insights) {
+        if (!explainPlanEl || !explainToolEl || !explainFallbackEl || !explainTraceEl) {
+            return;
+        }
+        const planStep = steps.find((step) => step.action_type === "plan");
+        const planReason = planStep?.thought
+            || insights?.recommended_improvements?.[0]
+            || "Planner selected a plan based on the request context and available tools.";
+        explainPlanEl.textContent = planReason;
+
+        const toolSteps = steps.filter((step) => step.tool_name);
+        const lastTool = toolSteps[toolSteps.length - 1];
+        if (lastTool?.explain?.ranked?.length) {
+            const top = lastTool.explain.ranked[0];
+            explainToolEl.textContent = `Selected ${lastTool.tool_name} with a routing score of ${top.score}, based on historical tool performance signals.`;
+        } else {
+            explainToolEl.textContent = "Tool selection was based on available tools and request context.";
+        }
+
+        const fallbacks = steps.filter((step) => step.status === "failed" || step.action_type === "recovery");
+        if (fallbacks.length) {
+            const last = fallbacks[fallbacks.length - 1];
+            const error = last?.output?.error || last?.output?.message || "tool failure";
+            explainFallbackEl.textContent = `Fallbacks were triggered after ${error}.`;
+        } else {
+            explainFallbackEl.textContent = "No retries or fallbacks detected.";
+        }
+
+        explainTraceEl.innerHTML = "";
+        steps
+            .filter((step) => step.action_type === "tool" || step.action_type === "recovery" || step.action_type === "plan")
+            .slice(-5)
+            .forEach((step) => {
+                const item = document.createElement("li");
+                if (step.action_type === "plan") {
+                    item.textContent = "Plan generated";
+                } else if (step.action_type === "recovery") {
+                    item.textContent = "Recovery plan executed";
+                } else {
+                    item.textContent = `Tool ${step.tool_name || "unknown"} ${step.status}`;
+                }
+                explainTraceEl.appendChild(item);
+            });
+    }
+
+    function buildStepBody(step) {
+        const body = document.createElement("div");
+        body.className = "timeline-body";
+
+        const sections = document.createElement("div");
+        sections.className = "timeline-sections";
+
+        if (step.thought) {
+            const thought = document.createElement("div");
+            thought.className = "timeline-section";
+            thought.innerHTML = `<div class=\"timeline-section-title\">Thinking</div><div class=\"timeline-thought\">${escapeHtml(step.thought)}</div>`;
+            sections.appendChild(thought);
+        }
+
+        if (step.tool_name || step.input) {
+            const toolSection = document.createElement("div");
+            toolSection.className = "timeline-section";
+            const toolTitle = step.tool_name ? `Tool: ${step.tool_name}` : "Tool input";
+            toolSection.appendChild(renderJsonBlock(toolTitle, step.input || {}));
+            sections.appendChild(toolSection);
+        }
+
+        if (step.output) {
+            const outputSection = document.createElement("div");
+            outputSection.className = "timeline-section";
+            outputSection.appendChild(renderJsonBlock("Result", step.output));
+            sections.appendChild(outputSection);
+        }
+
+        if (step.explain && step.explain.ranked && step.explain.ranked.length) {
+            const transparency = document.createElement("div");
+            transparency.className = "timeline-section transparency-panel";
+            const title = document.createElement("div");
+            title.className = "timeline-section-title";
+            title.textContent = "Tool selection transparency";
+            const list = document.createElement("div");
+            list.className = "tool-score-list";
+            step.explain.ranked.forEach((item) => {
+                const row = document.createElement("div");
+                row.className = "tool-score-item";
+                row.innerHTML = `<span>${item.tool}</span><span>${item.score}</span>`;
+                list.appendChild(row);
+            });
+            const note = document.createElement("div");
+            note.className = "muted";
+            note.textContent = `Selected ${step.explain.selected}. Scores reflect historical performance.`;
+            transparency.appendChild(title);
+            transparency.appendChild(list);
+            transparency.appendChild(note);
+            sections.appendChild(transparency);
+        }
+
+        body.appendChild(sections);
+        return body;
+    }
+
+    function renderStep(step) {
+        const type = detectStepType(step);
+        const status = normalizeStatus(step.status || "");
+        const actionType = (step.action_type || step.kind || "").toLowerCase();
+
+        const details = document.createElement("details");
+        details.className = `timeline-item timeline-${type}`;
+        details.dataset.type = type;
+        details.dataset.status = status || "pending";
+        details.dataset.hasTool = step.tool_name ? "true" : "false";
+        details.open = status === "error" || status === "failed" || status === "running";
+
+        const summary = document.createElement("summary");
+        summary.className = "timeline-header";
+
+        const left = document.createElement("div");
+        left.className = "timeline-title-group";
+
+        const icon = document.createElement("span");
+        icon.className = "timeline-icon";
+        icon.innerHTML = icons[type] || icons.thinking;
+
+        const title = document.createElement("div");
+        title.className = "timeline-title";
+        title.textContent = `Step ${step.step_number}`;
+
+        const subtitle = document.createElement("div");
+        subtitle.className = "timeline-subtitle";
+        subtitle.textContent = [step.tool_name ? `Tool: ${step.tool_name}` : "", actionType ? `Type: ${actionType}` : ""]
+            .filter(Boolean)
+            .join(" · ");
+
+        left.appendChild(icon);
+        const textBlock = document.createElement("div");
+        textBlock.appendChild(title);
+        if (subtitle.textContent) {
+            textBlock.appendChild(subtitle);
+        }
+        left.appendChild(textBlock);
+
+        const right = document.createElement("div");
+        right.className = "timeline-header-right";
+
+        const time = document.createElement("div");
+        time.className = "timeline-time";
+        time.textContent = formatTime(step.created_at);
+
+        const badge = document.createElement("span");
+        badge.className = `status-pill ${statusClassMap[status] || "status-pending"}`;
+        badge.textContent = status || "pending";
+
+        right.appendChild(time);
+        right.appendChild(badge);
+
+        summary.appendChild(left);
+        summary.appendChild(right);
+
+        summary.addEventListener("click", () => {
+            if (window.workspaceInspector) {
+                window.workspaceInspector.setStep(step);
+            }
+        });
+
+        const body = buildStepBody(step);
+
+        const actions = document.createElement("div");
+        actions.className = "timeline-actions";
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "btn btn-ghost";
+        copyBtn.textContent = "Copy step JSON";
+        copyBtn.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const payload = JSON.stringify(step, null, 2);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(payload).then(() => {
+                    copyBtn.textContent = "Copied";
+                    setTimeout(() => {
+                        copyBtn.textContent = "Copy step JSON";
+                    }, 1500);
+                });
+            } else {
+                window.prompt("Copy step JSON:", payload);
+            }
+        });
+
+        const replayBtn = document.createElement("button");
+        replayBtn.type = "button";
+        replayBtn.className = "btn btn-outline";
+        replayBtn.textContent = "Replay step";
+        replayBtn.setAttribute("title", "Coming soon");
+        replayBtn.disabled = true;
+        replayBtn.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+
+        actions.appendChild(copyBtn);
+        actions.appendChild(replayBtn);
+
+        details.appendChild(summary);
+        details.appendChild(actions);
+        details.appendChild(body);
+
+        timelineEl.appendChild(details);
+    }
+
+    function applyFilter() {
+        const items = timelineEl.querySelectorAll(".timeline-item");
+        items.forEach((item) => {
+            if (currentFilter === "all") {
+                item.classList.remove("hidden");
+                return;
+            }
+            if (currentFilter === "tool") {
+                item.classList.toggle("hidden", item.dataset.hasTool !== "true");
+                return;
+            }
+            if (currentFilter === "error") {
+                item.classList.toggle("hidden", item.dataset.status !== "error" && item.dataset.status !== "failed");
+            }
+        });
+    }
+
+    function renderTimeline(steps, replace) {
+        if (replace) {
+            timelineEl.innerHTML = "";
+        }
+        steps.forEach((step) => {
+            renderStep(step);
+            latestStep = Math.max(latestStep, step.step_index || 0);
+        });
+        if (!steps.length && replace) {
+            timelineEl.innerHTML = "<div class=\"muted\">No steps yet.</div>";
+        }
+        applyFilter();
+    }
+
+    function hydrateCache() {
+        const cached = sessionStorage.getItem(cacheKey);
+        if (!cached) {
+            return;
+        }
+        try {
+            const payload = JSON.parse(cached);
+            if (payload && payload.steps) {
+                cachedSteps = payload.steps;
+                latestStep = payload.latestStep || 0;
+                renderTimeline(payload.steps, true);
+            }
+        } catch (err) {
+            sessionStorage.removeItem(cacheKey);
+        }
+    }
+
+    function updateCache(steps, latest) {
+        cachedSteps = steps;
+        sessionStorage.setItem(
+            cacheKey,
+            JSON.stringify({
+                steps: cachedSteps,
+                latestStep: latest,
+                cachedAt: new Date().toISOString(),
+            })
+        );
+    }
+
+    async function loadTimeline() {
+        const response = await fetch(`/runs/${runId}/timeline`);
+        if (!response.ok) {
+            timelineEl.innerHTML = "<div class=\"muted\">Unable to load timeline.</div>";
+            return;
+        }
+        const payload = await response.json();
+        if (!agentInsights && agentId) {
+            const insightResponse = await fetch(`/insights/agents/${agentId}`);
+            if (insightResponse.ok) {
+                agentInsights = await insightResponse.json();
+            }
+        }
+        if (payload.steps) {
+            cachedSteps = payload.steps;
+            attachTransparency(payload.steps, agentInsights);
+            renderTimeline(payload.steps, true);
+            updateCache(payload.steps, latestStep);
+            updateExplanationPanel(payload.steps, agentInsights);
+        }
+    }
+
+    function updateRunMeta(run) {
+        if (!run) {
+            return;
+        }
+        const status = normalizeStatus(run.status);
+        statusEl.textContent = status || "pending";
+        statusEl.className = `status-pill ${statusClassMap[status] || "status-pending"}`;
+        if (run.output_text !== undefined && run.output_text !== null) {
+            outputEl.textContent = run.output_text;
+        }
+        if (run.error_message !== undefined && run.error_message !== null) {
+            errorEl.textContent = run.error_message || "";
+            errorEl.classList.toggle("hidden", !run.error_message);
+        }
+        if (run.updated_at) {
+            updatedEl.textContent = formatTime(run.updated_at);
+        }
+        if (run.started_at) {
+            startedEl.textContent = formatTime(run.started_at);
+        }
+        if (run.finished_at) {
+            finishedEl.textContent = formatTime(run.finished_at);
+        }
+    }
+
+    async function pollUpdates() {
+        if (!isPolling) {
+            return;
+        }
+        const response = await fetch(`/runs/${runId}/stream?since_step=${latestStep}`);
+        if (!response.ok) {
+            timelineStatusEl.textContent = "Polling paused";
+            pollDelay = Math.min(pollDelay * 1.5, 15000);
+            schedulePoll();
+            return;
+        }
+        const payload = await response.json();
+        let hasNewSteps = false;
+        if (payload.steps && payload.steps.length) {
+            attachTransparency(payload.steps, agentInsights);
+            renderTimeline(payload.steps, false);
+            cachedSteps = cachedSteps.concat(payload.steps);
+            hasNewSteps = true;
+        }
+        if (payload.run) {
+            updateRunMeta(payload.run);
+            const status = normalizeStatus(payload.run.status);
+            if (status === "completed" || status === "success" || status === "error" || status === "failed") {
+                isPolling = false;
+                timelineStatusEl.textContent = "Polling stopped";
+            }
+        }
+        if (payload.latest_step !== undefined && payload.latest_step !== null) {
+            latestStep = Math.max(latestStep, payload.latest_step);
+        }
+        updateCache(cachedSteps, latestStep);
+        updateExplanationPanel(cachedSteps, agentInsights);
+
+        if (hasNewSteps) {
+            pollDelay = 2000;
+            timelineStatusEl.textContent = "Live polling";
+        } else {
+            pollDelay = Math.min(pollDelay * 1.4, 15000);
+            timelineStatusEl.textContent = `Idle - next check in ${Math.round(pollDelay / 1000)}s`;
+        }
+        schedulePoll();
+    }
+
+    function schedulePoll() {
+        if (!isPolling) {
+            return;
+        }
+        setTimeout(pollUpdates, pollDelay);
+    }
+
+    filterButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+            filterButtons.forEach((btn) => btn.classList.remove("active"));
+            button.classList.add("active");
+            currentFilter = button.dataset.filter || "all";
+            applyFilter();
+        });
+    });
+
+    hydrateCache();
+    loadTimeline();
+    schedulePoll();
+</script>
+{% endblock %}
