@@ -216,6 +216,23 @@ def create_link_token(
     return {"token": token, "link": link, "expires_in": settings.telegram_link_ttl_seconds}
 
 
+@router.get("/status")
+def telegram_status(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    link = db.execute(
+        select(TelegramLink).where(TelegramLink.user_id == current_user.id)
+    ).scalar_one_or_none()
+    bot_username = _get_bot_username(db)
+    return {
+        "connected": bool(link),
+        "bot_username": bot_username,
+        "display_name": link.display_name if link else None,
+        "telegram_user_id": link.telegram_user_id if link else None,
+    }
+
+
 @router.post("/webhook")
 def telegram_webhook(
     update: dict,

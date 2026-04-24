@@ -501,6 +501,7 @@ input:focus {
     margin-top: 16px;
     display: flex;
     gap: 10px;
+    align-items: center;
 }
 
 .chat-input {
@@ -509,6 +510,7 @@ input:focus {
     border: 1px solid var(--border);
     padding: 12px 14px;
     font-size: 1rem;
+    min-height: 46px;
 }
 
 .chat-status {

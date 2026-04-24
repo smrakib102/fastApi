@@ -102,6 +102,10 @@
                             </label>
                             <button class="btn" type="submit">Reset password</button>
                         </form>
+                        <form class="form-stack" method="post" action="/admin/users/delete" onsubmit="return confirm('Delete this user and all related data?');">
+                            <input type="hidden" name="user_id" value="{{ u.id }}" />
+                            <button class="btn btn-outline" type="submit">Delete user</button>
+                        </form>
                     </div>
                 {% endfor %}
             </div>

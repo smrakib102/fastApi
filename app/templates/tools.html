@@ -31,6 +31,44 @@
     const connectBtn = document.getElementById("connect-telegram");
     const statusEl = document.getElementById("telegram-status");
 
+    function renderTelegramStatus(payload) {
+        if (!payload) {
+            statusEl.textContent = "Unable to read Telegram status.";
+            return;
+        }
+        if (payload.connected) {
+            const displayName = payload.display_name || "telegram-user";
+            statusEl.textContent = `Connected as ${displayName}.`;
+            if (payload.bot_username) {
+                statusEl.textContent += ` Bot: @${payload.bot_username}.`;
+            }
+            connectBtn.disabled = true;
+            connectBtn.textContent = "Connected";
+            return;
+        }
+
+        if (!payload.bot_username) {
+            statusEl.textContent = "Bot username not configured.";
+            connectBtn.disabled = false;
+            connectBtn.textContent = "Connect Telegram";
+            return;
+        }
+
+        statusEl.textContent = "Not connected yet.";
+        connectBtn.disabled = false;
+        connectBtn.textContent = "Connect Telegram";
+    }
+
+    async function loadTelegramStatus() {
+        const response = await fetch("/telegram/status");
+        if (!response.ok) {
+            statusEl.textContent = "Unable to read Telegram status.";
+            return;
+        }
+        const payload = await response.json();
+        renderTelegramStatus(payload);
+    }
+
     connectBtn.addEventListener("click", async () => {
         statusEl.textContent = "Generating link...";
         const response = await fetch("/telegram/link-token", { method: "POST" });
@@ -45,5 +83,7 @@
             statusEl.textContent = "Bot username not configured.";
         }
     });
+
+    loadTelegramStatus();
 </script>
 {% endblock %}

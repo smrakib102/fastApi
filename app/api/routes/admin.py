@@ -16,6 +16,15 @@ from app.core.crypto import encrypt_value, mask_value
 from app.core.security import create_access_token, hash_password
 from app.models.admin_setting import AdminSetting
 from app.models.user import User
+from app.models.agent import Agent
+from app.models.agent_run import AgentRun
+from app.models.agent_run_step import AgentRunStep
+from app.models.user_profile import UserProfile
+from app.models.user_limit import UserLimit
+from app.models.telegram_link import TelegramLink
+from app.models.telegram_message import TelegramMessage
+from app.models.tool_request import ToolRequest
+from app.models.tool_credential import ToolCredential
 from app.models.user_limit import UserLimit
 from app.services.audit_log import record_audit
 from app.services.email_service import send_email
@@ -425,6 +434,38 @@ def unlock_user(
     db.add(target)
     db.commit()
     record_audit(db, current_user.id, "unlock_user", "user", str(user_id))
+    return {"ok": True}
+
+
+@router.post("/users/delete")
+def delete_user(
+    user_id: int = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_user),
+):
+    target = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    if target.email == settings.legacy_user_email:
+        raise HTTPException(status_code=400, detail="Cannot delete legacy user")
+
+    db.query(AgentRunStep).filter(AgentRunStep.run_id.in_(
+        select(AgentRun.id).where(AgentRun.user_id == target.id)
+    )).delete(synchronize_session=False)
+    db.query(AgentRun).filter(AgentRun.user_id == target.id).delete(synchronize_session=False)
+    db.query(Agent).filter(Agent.user_id == target.id).delete(synchronize_session=False)
+    db.query(UserProfile).filter(UserProfile.user_id == target.id).delete(synchronize_session=False)
+    db.query(UserLimit).filter(UserLimit.user_id == target.id).delete(synchronize_session=False)
+    db.query(TelegramLink).filter(TelegramLink.user_id == target.id).delete(synchronize_session=False)
+    db.query(TelegramMessage).filter(TelegramMessage.user_id == target.id).delete(synchronize_session=False)
+    db.query(ToolRequest).filter(ToolRequest.user_id == target.id).delete(synchronize_session=False)
+    db.query(ToolCredential).filter(ToolCredential.user_id == target.id).delete(synchronize_session=False)
+
+    db.delete(target)
+    db.commit()
+    record_audit(db, current_user.id, "delete_user", "user", str(user_id))
     return {"ok": True}
 
 
