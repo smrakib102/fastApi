@@ -936,6 +936,44 @@ def telegram_webhook(
             _send_message(db, chat_id, "Sorry — something went wrong. Please try again.")
         return {"ok": True}
 
+    # Friendly fallback for linked users when unified ChatService is OFF.
+    # Without this, bare /start, /help, or any plain text from a linked
+    # user produces silence because none of the legacy command branches
+    # above match. Always reply so the bot is never mute.
+    stripped = (text or "").strip()
+    if stripped == "/start":
+        _send_message(
+            db,
+            chat_id,
+            "You're already linked. Use /help to see available commands.",
+        )
+        return {"ok": True}
+    if stripped in {"/help", "/commands"}:
+        _send_message(
+            db,
+            chat_id,
+            "<b>Available commands</b>\n"
+            "/run &lt;agent&gt; &lt;prompt&gt; — execute an agent\n"
+            "/newagent — create a new agent from a template\n"
+            "/summary_now — generate an instant summary\n"
+            "/help — show this message",
+        )
+        return {"ok": True}
+    if stripped.startswith("/"):
+        _send_message(
+            db,
+            chat_id,
+            f"Unknown command: <code>{stripped.split()[0]}</code>. Send /help for the list.",
+        )
+        return {"ok": True}
+    if stripped:
+        _send_message(
+            db,
+            chat_id,
+            "I received your message. Use /help to see what I can do, or visit the dashboard for full chat.",
+        )
+        return {"ok": True}
+
     return {"ok": True}
 
 
