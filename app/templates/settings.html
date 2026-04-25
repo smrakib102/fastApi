@@ -7,6 +7,14 @@
         <h2>AI provider keys</h2>
         <p>Add personal keys to override admin defaults.</p>
     </div>
+    {% if secrets_env_only %}
+    <div class="info-panel" style="background:#fff8e1; border-left:4px solid #f0b400; padding:12px;">
+        <b>Locked:</b> This deployment runs in <code>SECRETS_ENV_ONLY</code> mode.
+        Provider keys must be configured via environment variables on the server
+        (e.g. <code>OPENAI_API_KEY</code>, <code>GEMINI_API_KEY</code>) and cannot
+        be entered through the UI.
+    </div>
+    {% else %}
     <form class="form-stack" method="post" action="/dashboard/keys">
         <label>
             <span>OpenAI API key</span>
@@ -21,5 +29,6 @@
     <p class="muted">
         OpenAI configured: {{ "yes" if key_map.get("openai_api_key") else "no" }} · Gemini configured: {{ "yes" if key_map.get("gemini_api_key") else "no" }}
     </p>
+    {% endif %}
 </section>
 {% endblock %}

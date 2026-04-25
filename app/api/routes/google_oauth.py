@@ -104,6 +104,43 @@ def google_oauth_start(current_user: User = Depends(require_user)):
     return {"url": f"{GOOGLE_AUTH_URL}?{urlencode(params)}"}
 
 
+# Phase 8: bridge endpoint that lets Telegram users (who have no web
+# session) start the Google OAuth dance via a one-time token. The token
+# is minted on the Telegram side via PermissionService.connect; this
+# endpoint trades it for an OAuth state and 302s the browser to Google.
+@router.get("/oauth/bridge/{bridge_token}")
+def google_oauth_bridge(bridge_token: str):
+    from fastapi.responses import RedirectResponse
+
+    _require_google_config()
+
+    redis_client = get_redis()
+    bridge_key = f"oauth:bridge:{bridge_token}"
+    raw_user_id = redis_client.get(bridge_key)
+    if not raw_user_id:
+        raise HTTPException(status_code=400, detail="Bridge token invalid or expired")
+    redis_client.delete(bridge_key)
+
+    user_id = int(raw_user_id)
+    state_token = secrets.token_urlsafe(32)
+    redis_client.setex(
+        f"oauth:state:{state_token}",
+        settings.google_oauth_state_ttl_seconds,
+        str(user_id),
+    )
+
+    params = {
+        "client_id": settings.google_oauth_client_id,
+        "redirect_uri": settings.google_oauth_redirect_uri,
+        "response_type": "code",
+        "access_type": "offline",
+        "prompt": "consent",
+        "scope": _build_scopes(),
+        "state": state_token,
+    }
+    return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}", status_code=302)
+
+
 @router.get("/oauth/callback")
 def google_oauth_callback(
     code: str = Query(...),

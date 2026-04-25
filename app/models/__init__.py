@@ -1,6 +1,8 @@
 from app.models.admin_setting import AdminSetting
 from app.models.audit_log import AuditLog
 from app.models.agent import Agent
+from app.models.chat_message import ChatMessage
+from app.models.conversation import Conversation
 from app.models.agent_run import AgentRun
 from app.models.agent_run_step import AgentRunStep
 from app.models.agent_relation import AgentRelation
@@ -37,6 +39,8 @@ __all__ = [
 	"AgentPerformance",
 	"AgentRun",
 	"AgentRunStep",
+	"ChatMessage",
+	"Conversation",
 	"Employee",
 	"GoogleAccount",
 	"ModelPerformance",

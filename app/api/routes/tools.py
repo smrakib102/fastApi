@@ -79,6 +79,21 @@ def _validate_nonce(nonce: str) -> None:
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid nonce") from exc
 
+    # S3: Redis-backed replay protection. Falls back to in-process dict
+    # if Redis is unreachable (still better than no protection at all).
+    try:
+        from app.core.redis_client import get_redis
+
+        key = f"tool:nonce:{nonce}"
+        # SET NX EX 60 — atomic claim-or-reject.
+        if not get_redis().set(key, "1", ex=60, nx=True):
+            raise HTTPException(status_code=401, detail="Nonce replay detected")
+        return
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("nonce_redis_unavailable_fallback")
+
     now = time.time()
     cutoff = now - 60
     expired = [key for key, expires_at in _nonce_cache.items() if expires_at <= cutoff]
@@ -118,6 +133,32 @@ def _execute_tool_internal(
         payload.name,
         {"agent_id": internal_agent_id},
     )
+
+    # Phase 5: consult the plugin registry FIRST when enabled. Plugins
+    # take precedence over the legacy if/elif chain so the codebase can
+    # migrate tools incrementally without a flag flip per tool.
+    if settings.plugin_loader_enabled:
+        try:
+            from app.plugins import plugin_registry
+            from app.plugins.base import PluginExecutionError, ToolContext
+
+            plugin_registry.discover()
+            plugin = plugin_registry.get(payload.name)
+            if plugin is not None:
+                ctx = ToolContext(
+                    db=db,
+                    user_id=int(internal_user_id),
+                    agent_id=internal_agent_id,
+                )
+                try:
+                    return plugin.handler(payload.arguments, ctx)
+                except PluginExecutionError as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("plugin_dispatch_failed", extra={"tool": payload.name})
+            raise HTTPException(status_code=500, detail="Plugin dispatch failed") from exc
 
     if payload.name == "gmail.draft":
         return _gmail_draft(payload.arguments, db, internal_user_id)

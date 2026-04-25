@@ -10,16 +10,90 @@ from sqlalchemy.orm import Session
 
 from app.api.routes import tools as tool_routes
 from app.core.config import settings
+from app.core.redis_client import get_redis
 from app.worker.celery_app import celery_app
 from app.models.approval import Approval
 
 logger = logging.getLogger(__name__)
 
+# S3: Circuit breaker state moved to Redis so it survives worker restarts
+# and is shared across worker pods. Falls back to local dict if Redis is
+# unreachable, so the breaker never silently disables itself.
 _tool_circuit: dict[str, dict[str, float]] = {}
+_CIRCUIT_KEY = "tool:circuit:{name}"
+
+
+def _circuit_get(tool_name: str) -> dict[str, float]:
+    try:
+        raw = get_redis().get(_CIRCUIT_KEY.format(name=tool_name))
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        logger.debug("circuit_redis_get_failed", extra={"tool": tool_name})
+    return _tool_circuit.get(tool_name, {})
+
+
+def _circuit_set(tool_name: str, state: dict[str, float], ttl: int) -> None:
+    _tool_circuit[tool_name] = state
+    try:
+        get_redis().setex(
+            _CIRCUIT_KEY.format(name=tool_name), max(ttl, 1), json.dumps(state)
+        )
+    except Exception:
+        logger.debug("circuit_redis_set_failed", extra={"tool": tool_name})
+
+
+def _circuit_clear(tool_name: str) -> None:
+    _tool_circuit.pop(tool_name, None)
+    try:
+        get_redis().delete(_CIRCUIT_KEY.format(name=tool_name))
+    except Exception:
+        logger.debug("circuit_redis_clear_failed", extra={"tool": tool_name})
 
 
 class ToolExecutionError(RuntimeError):
     pass
+
+
+# S7: Tool errors that look like an expired/missing OAuth token are turned
+# into a graceful "reconnect required" signal. The first run that hits
+# this also files a fresh PermissionService.request so the user gets a
+# reconnect card next time the chat surface renders.
+_OAUTH_FAIL_HINTS = (
+    "missing refresh token",
+    "no google account",
+    "failed to refresh token",
+    "invalid_grant",
+    "401",
+)
+
+
+def _looks_like_oauth_failure(detail: str) -> bool:
+    if not detail:
+        return False
+    lo = detail.lower()
+    return any(hint in lo for hint in _OAUTH_FAIL_HINTS)
+
+
+def _trigger_reconnect(db: Session, tool_name: str, user_id: int) -> None:
+    """Best-effort: ask PermissionService to surface a reconnect card.
+    Never raises — OAuth failure handling must not double-fault."""
+    try:
+        from app.models.user import User
+        from app.services.permission_service import permission_service
+
+        user = db.get(User, user_id)
+        if not user:
+            return
+        permission_service.request(
+            db,
+            user=user,
+            tool_name=tool_name,
+            reason=f"{tool_name} access expired — please reconnect.",
+        )
+        db.flush()
+    except Exception:
+        logger.debug("oauth_reconnect_request_failed", extra={"tool": tool_name})
 
 
 def execute_tool(
@@ -43,11 +117,21 @@ def execute_tool(
             logger.warning("tool_execute_http_error", extra={"tool": name, "status": exc.status_code})
             if attempt >= retries:
                 _record_tool_failure(name)
+                if _looks_like_oauth_failure(str(exc.detail)):
+                    _trigger_reconnect(db, name, internal_user_id)
+                    raise ToolExecutionError(
+                        f"Reconnect required for {name}: {exc.detail}"
+                    ) from exc
                 raise ToolExecutionError(str(exc.detail)) from exc
         except Exception as exc:
             logger.warning("tool_execute_error", extra={"tool": name, "error": str(exc)})
             if attempt >= retries:
                 _record_tool_failure(name)
+                if _looks_like_oauth_failure(str(exc)):
+                    _trigger_reconnect(db, name, internal_user_id)
+                    raise ToolExecutionError(
+                        f"Reconnect required for {name}: {exc}"
+                    ) from exc
                 raise ToolExecutionError(str(exc)) from exc
 
     raise ToolExecutionError("Tool execution failed")
@@ -111,25 +195,32 @@ def _execute_via_worker(
 
 
 def _ensure_circuit_open(tool_name: str) -> None:
-    state = _tool_circuit.get(tool_name)
+    state = _circuit_get(tool_name)
     if not state:
         return
     open_until = state.get("open_until", 0)
-    if time.monotonic() < open_until:
+    # Stored as wall-clock epoch seconds (so it's comparable across pods).
+    if time.time() < open_until:
         raise ToolExecutionError("Tool circuit breaker open")
 
 
 def _record_tool_failure(tool_name: str) -> None:
-    failures = _tool_circuit.get(tool_name, {}).get("failures", 0) + 1
-    state = _tool_circuit.setdefault(tool_name, {})
+    state = _circuit_get(tool_name) or {}
+    failures = int(state.get("failures", 0)) + 1
     state["failures"] = failures
+    cooldown = settings.agent_tool_circuit_cooldown_seconds
+    ttl = cooldown
     if failures >= settings.agent_tool_circuit_breaker_failures:
-        state["open_until"] = time.monotonic() + settings.agent_tool_circuit_cooldown_seconds
+        state["open_until"] = time.time() + cooldown
+        ttl = cooldown
+    else:
+        # Keep failure-count window short so transient blips decay.
+        ttl = max(cooldown, 60)
+    _circuit_set(tool_name, state, ttl)
 
 
 def _record_tool_success(tool_name: str) -> None:
-    if tool_name in _tool_circuit:
-        _tool_circuit.pop(tool_name, None)
+    _circuit_clear(tool_name)
 
 
 def _validate_tool_schema(db: Session, name: str, args: dict) -> None:

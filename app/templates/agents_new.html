@@ -5,6 +5,13 @@
 <a class="btn btn-secondary" href="/dashboard/agents">Back to agents</a>
 {% endblock %}
 {% block content %}
+{% if unified_chat_enabled %}
+<div class="notice notice-info" style="margin-bottom:1rem;padding:.75rem 1rem;border:1px solid #cfd8dc;border-radius:6px;background:#f5fbff;">
+    <strong>This wizard is deprecated.</strong>
+    Try the new chat experience &mdash; just describe what you want in plain English.
+    <a class="btn btn-primary" href="/dashboard/chat" style="margin-left:1rem;">Open chat</a>
+</div>
+{% endif %}
 <section class="wizard">
     <div class="wizard-steps">
         <span class="wizard-step active" data-step="1">1. Mission</span>

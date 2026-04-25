@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_admin, require_admin_user
 from app.core.config import settings
+from app.core.config import settings as app_settings  # explicit alias for use in shadowed scopes
 from app.core.redis_client import get_redis
 from app.core.crypto import encrypt_value, mask_value
 from app.core.security import create_access_token, hash_password
@@ -226,6 +227,32 @@ def list_settings(
     }
 
 
+@router.get("/plugins")
+def list_plugins(
+    current_user: User = Depends(require_admin_user),
+):
+    """Phase 5: list registered plugins. Returns an empty list when the
+    plugin loader is disabled, so callers can use this as a feature probe.
+    """
+    if not app_settings.plugin_loader_enabled:
+        return {"enabled": False, "items": []}
+    from app.plugins import plugin_registry
+
+    plugin_registry.discover()
+    return {
+        "enabled": True,
+        "items": [
+            {
+                "name": p.name,
+                "category": p.category,
+                "description": p.description,
+                "required_scopes": list(p.required_scopes),
+            }
+            for p in plugin_registry.all()
+        ],
+    }
+
+
 @router.post("/settings")
 def update_settings(
     db: Session = Depends(get_db),
@@ -237,6 +264,15 @@ def update_settings(
     default_model_provider: str | None = Form(default=None),
     code_model_provider: str | None = Form(default=None),
 ):
+    # Phase 7: secrets-via-UI lockdown.
+    if settings.secrets_env_only and (telegram_bot_token or openai_api_key or gemini_api_key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SECRETS_ENV_ONLY is enabled. Provider keys and the Telegram bot "
+                "token must be supplied via environment variables, not the UI."
+            ),
+        )
     if telegram_bot_token:
         _upsert_setting(db, "telegram_bot_token", telegram_bot_token)
         record_audit(db, current_user.id, "update_setting", "admin_setting", "telegram_bot_token")
@@ -296,8 +332,8 @@ def admin_panel(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_user),
 ):
-    settings = db.execute(select(AdminSetting)).scalars().all()
-    settings_map = {setting.key: setting.value for setting in settings}
+    settings_rows = db.execute(select(AdminSetting)).scalars().all()
+    settings_map = {row.key: row.value for row in settings_rows}
     masked_settings = {
         key: mask_value(value)
         for key, value in settings_map.items()
@@ -314,6 +350,7 @@ def admin_panel(
             "masked_settings": masked_settings,
             "limits": limits,
             "users": users,
+            "secrets_env_only": app_settings.secrets_env_only,
         },
     )
 
@@ -330,6 +367,15 @@ def admin_panel_settings(
     default_model_provider: str | None = Form(default=None),
     code_model_provider: str | None = Form(default=None),
 ):
+    # Phase 7: secrets-via-UI lockdown.
+    if settings.secrets_env_only and (telegram_bot_token or openai_api_key or gemini_api_key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SECRETS_ENV_ONLY is enabled. Set the Telegram bot token and "
+                "provider keys via environment variables instead."
+            ),
+        )
     if telegram_bot_token:
         _upsert_setting(db, "telegram_bot_token", telegram_bot_token)
         record_audit(db, current_user.id, "update_setting", "admin_setting", "telegram_bot_token")

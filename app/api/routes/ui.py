@@ -177,6 +177,14 @@ def dashboard_create_agent(
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
 
+    # Patch P6: when the unified pipeline is enabled, the form-based agent
+    # creation path is deprecated. Redirect to the chat surface so users
+    # land on the single canonical creation flow (NL AgentBuilder).
+    from app.core.config import settings as _settings  # local import to avoid cycles
+
+    if _settings.unified_chat_enabled:
+        return RedirectResponse("/dashboard/chat", status_code=303)
+
     existing = db.execute(select(Agent).where(Agent.name == name)).scalar_one_or_none()
     if existing:
         return RedirectResponse("/dashboard/agents?error=name", status_code=303)
@@ -262,6 +270,17 @@ def dashboard_update_keys(
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
 
+    # Phase 7: secrets-via-UI lockdown.
+    from app.core.config import settings as _settings  # local import to avoid cycles
+    if _settings.secrets_env_only and (openai_api_key or gemini_api_key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SECRETS_ENV_ONLY is enabled. Provider keys must be supplied "
+                "via environment variables, not the Settings page."
+            ),
+        )
+
     def upsert(key: str, value: str):
         stored = encrypt_value(value)
         existing = db.execute(
@@ -315,11 +334,17 @@ def chat_page(
 ):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
+    # Phase 2c: expose the unified-chat flag so the template can switch
+    # between the legacy per-agent run flow and the new ChatService flow.
+    from app.core.config import settings as _settings  # local import to avoid cycles
+
+    unified_enabled = bool(_settings.unified_chat_enabled)
     return templates.TemplateResponse(
         "chat.html",
         {
             "request": request,
             "user": current_user,
+            "unified_chat_enabled": unified_enabled,
         },
     )
 
@@ -331,11 +356,19 @@ def agent_builder(
 ):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
+    from app.core.config import settings as _settings  # local import to avoid cycles
+
+    # Patch P6: the legacy wizard is deprecated when the unified pipeline
+    # is enabled. Send users to the chat surface (NL AgentBuilder).
+    if _settings.unified_chat_enabled:
+        return RedirectResponse("/dashboard/chat", status_code=303)
+
     return templates.TemplateResponse(
         "agents_new.html",
         {
             "request": request,
             "user": current_user,
+            "unified_chat_enabled": False,
         },
     )
 
@@ -373,12 +406,14 @@ def settings_page(
     ).scalars().all()
     key_map = {item.key: item.value for item in keys}
 
+    from app.core.config import settings as _settings  # local import to avoid cycles
     return templates.TemplateResponse(
         "settings.html",
         {
             "request": request,
             "user": current_user,
             "key_map": key_map,
+            "secrets_env_only": _settings.secrets_env_only,
         },
     )
 

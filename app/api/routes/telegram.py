@@ -147,6 +147,8 @@ def _get_bot_token(db: Session) -> str | None:
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_token")
     ).scalar_one_or_none()
+    if settings.secrets_env_only:
+        return settings.telegram_bot_token
     return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
 
 
@@ -301,6 +303,41 @@ def telegram_webhook(
                 _answer_callback(db, callback_id, "Request not found")
             return {"ok": True}
 
+        # Patch P3: route every decision through PermissionService so the
+        # web and Telegram surfaces share the same state machine. The
+        # Telegram-specific UX (Redis pending-key state, OAuth bridge
+        # link) is layered on top after the service has updated the
+        # ToolRequest row.
+        from app.models.user import User as _User  # local import to avoid cycle
+        from app.services.permission_service import (
+            DECISION_ALLOW,
+            DECISION_CONNECT,
+            DECISION_SKIP,
+            permission_service,
+        )
+
+        _decision_map = {
+            "apikey": DECISION_ALLOW,
+            "skip": DECISION_SKIP,
+            "oauth": DECISION_CONNECT,
+        }
+        decision = _decision_map.get(action)
+        if not decision:
+            if callback_id:
+                _answer_callback(db, callback_id, "Unsupported action")
+            return {"ok": True}
+
+        user_obj = db.get(_User, user_id)
+        if user_obj is None:
+            if callback_id:
+                _answer_callback(db, callback_id, "User missing")
+            return {"ok": True}
+
+        result = permission_service.resolve(
+            db, user=user_obj, request_id=req.id, decision=decision
+        )
+        db.commit()
+
         if action == "apikey":
             redis_client = get_redis()
             redis_client.setex(
@@ -326,9 +363,6 @@ def telegram_webhook(
             return {"ok": True}
 
         if action == "skip":
-            req.status = "skipped"
-            db.add(req)
-            db.commit()
             _send_message(
                 db,
                 chat_id,
@@ -339,16 +373,48 @@ def telegram_webhook(
             return {"ok": True}
 
         if action == "oauth":
-            req.status = "waiting_oauth"
-            db.add(req)
-            db.commit()
+            # PermissionService has already moved the row into
+            # ``waiting_oauth``. The web "/google/login" URL it returns
+            # is replaced here with a Telegram-friendly bridge link
+            # (Phase 8) so the user can complete OAuth from a browser.
+            base_url = (settings.public_base_url or "").rstrip("/")
+            redirect_uri = settings.google_oauth_redirect_uri or ""
+            if not base_url and redirect_uri:
+                from urllib.parse import urlparse as _urlparse
+
+                parsed = _urlparse(redirect_uri)
+                if parsed.scheme and parsed.netloc:
+                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+            if not result.get("ok") or not base_url or not settings.google_oauth_client_id:
+                _send_message(
+                    db,
+                    chat_id,
+                    result.get("message")
+                    or "OAuth bridge isn't configured on the server. "
+                    "Please ask an admin to set PUBLIC_BASE_URL.",
+                )
+                if callback_id:
+                    _answer_callback(db, callback_id, "OAuth not ready")
+                return {"ok": True}
+
+            bridge_token = secrets.token_urlsafe(24)
+            redis_client = get_redis()
+            redis_client.setex(
+                f"oauth:bridge:{bridge_token}",
+                settings.google_oauth_state_ttl_seconds,
+                str(user_id),
+            )
+            bridge_url = f"{base_url}/google/oauth/bridge/{bridge_token}"
             _send_message(
                 db,
                 chat_id,
-                "OAuth flow is not configured yet. Please choose API key for now.",
+                "<b>Connect Google</b>\n"
+                f"Open this link in your browser to authorize <code>{req.tool_name}</code>:\n"
+                f"{bridge_url}",
             )
             if callback_id:
-                _answer_callback(db, callback_id, "OAuth not ready")
+                _answer_callback(db, callback_id, "Open the link to connect")
             return {"ok": True}
 
     chat = message.get("chat", {})
@@ -373,6 +439,23 @@ def telegram_webhook(
     summary_now = _is_summary_now(text)
     new_agent = _is_new_agent(text)
     confirm_token = _extract_confirm_token(text)
+
+    # Patch P2: when the unified Telegram pipeline is enabled, suppress the
+    # legacy regex-driven command branches (/run, /newagent, /summary_now,
+    # confirmation tokens) so the message falls through to ChatService at
+    # the end of this handler. /start linking and /setkey block are kept,
+    # since they rely on Telegram-specific Redis state. Pending-state
+    # message handlers above (template wizard, setkey collection) also
+    # short-circuit before this block via their own returns and remain
+    # unaffected.
+    _telegram_unified = (
+        settings.unified_chat_telegram_enabled or settings.unified_chat_enabled
+    )
+    if _telegram_unified:
+        run_request = None
+        summary_now = False
+        new_agent = False
+        confirm_token = None
 
     linked_user_id: int | None = None
     if start_token:
@@ -476,20 +559,26 @@ def telegram_webhook(
     if message.get("date"):
         sent_at = datetime.fromtimestamp(message.get("date"), tz=timezone.utc)
 
-    db.add(
-        TelegramMessage(
-            user_id=linked_user_id,
-            chat_id=str(chat_id),
-            chat_type=chat_type,
-            message_id=str(message.get("message_id") or ""),
-            sender_id=str(sender.get("id")) if sender.get("id") else None,
-            sender_name=_build_display_name(message),
-            text=text,
-            sent_at=sent_at,
-            raw_json=json.dumps(message, ensure_ascii=True),
+    # Patch P4: when the unified Telegram pipeline is enabled, ChatService
+    # → MemoryService is the canonical store (chat_messages table). Skip
+    # the legacy telegram_messages insert in that mode so we don't
+    # double-write. The table is preserved as a raw audit trail for the
+    # pre-unified path.
+    if not _telegram_unified:
+        db.add(
+            TelegramMessage(
+                user_id=linked_user_id,
+                chat_id=str(chat_id),
+                chat_type=chat_type,
+                message_id=str(message.get("message_id") or ""),
+                sender_id=str(sender.get("id")) if sender.get("id") else None,
+                sender_name=_build_display_name(message),
+                text=text,
+                sent_at=sent_at,
+                raw_json=json.dumps(message, ensure_ascii=True),
+            )
         )
-    )
-    db.commit()
+        db.commit()
 
     if run_request:
         agent_ref, prompt = run_request
@@ -728,6 +817,58 @@ def telegram_webhook(
             get_redis().delete(f"telegram:template:{chat_id}")
             _send_message(db, chat_id, f"Created agent <code>{agent.name}</code>.")
             return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Phase 2d: Unified ChatService fallback for free-text messages.
+    # Gated by UNIFIED_CHAT_TELEGRAM_ENABLED so existing slash-command
+    # behavior is preserved by default. Patch P2: when the unified flag
+    # is on, slash commands like /run and /newagent are also routed
+    # through ChatService (the IntentRouter already classifies them).
+    # Pending-state messages (setkey, template field collection) still
+    # short-circuit before this block via their own returns.
+    # ------------------------------------------------------------------
+    if _telegram_unified and text:
+        try:
+            from app.models.user import User as _User  # local import to avoid top-level cycle
+            from app.services.chat_service import chat_service as _chat_service
+            from app.services.memory_service import CHANNEL_TELEGRAM as _CHANNEL_TG
+
+            user_obj = db.get(_User, linked_user_id)
+            if user_obj is not None:
+                response = _chat_service.handle_message(
+                    db,
+                    user=user_obj,
+                    text=text,
+                    channel=_CHANNEL_TG,
+                    external_ref=str(chat_id),
+                )
+                db.commit()
+                _send_message(db, chat_id, response.text or "(no response)")
+                # Phase 4: render permission_request action cards as inline
+                # keyboards. Reuses the existing toolreq:* callback handler
+                # since PermissionService writes to the same ToolRequest table.
+                for action in (response.actions or []):
+                    if action.get("type") != "permission_request":
+                        continue
+                    try:
+                        _send_tool_request(
+                            db,
+                            chat_id,
+                            int(action.get("request_id")),
+                            str(action.get("tool_name") or "tool"),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "telegram_permission_render_failed",
+                            extra={"chat_id": str(chat_id)},
+                        )
+        except Exception:  # noqa: BLE001 — never break the webhook
+            logger.exception(
+                "telegram_chat_service_error",
+                extra={"chat_id": str(chat_id), "user_id": linked_user_id},
+            )
+            _send_message(db, chat_id, "Sorry — something went wrong. Please try again.")
+        return {"ok": True}
 
     return {"ok": True}
 

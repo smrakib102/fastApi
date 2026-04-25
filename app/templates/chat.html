@@ -34,6 +34,7 @@
 </section>
 
 <script>
+    const UNIFIED_CHAT_ENABLED = {{ 'true' if unified_chat_enabled else 'false' }};
     const agentSelect = document.getElementById("agent-select");
     const chatMessages = document.getElementById("chat-messages");
     const chatStatus = document.getElementById("chat-status");
@@ -216,6 +217,30 @@
     }
 
     async function loadAgents() {
+        if (UNIFIED_CHAT_ENABLED) {
+            // In unified-chat mode, agent selection is optional — the chat
+            // service routes the message itself. Repurpose the dropdown as
+            // an "active agent (optional)" pin and never block the composer.
+            agentSelect.innerHTML = "<option value=\"\">Auto (let chat decide)</option>";
+            chatStatus.textContent = "Ready";
+            chatInput.disabled = false;
+            chatSend.disabled = false;
+            createAgentNotice.style.display = "none";
+            try {
+                const response = await fetch("/agents");
+                if (response.ok) {
+                    const payload = await response.json();
+                    payload.items.forEach((agent) => {
+                        const option = document.createElement("option");
+                        option.value = agent.id;
+                        option.textContent = `Pin to: ${agent.name}`;
+                        agentSelect.appendChild(option);
+                        agentCache.set(agent.id, agent);
+                    });
+                }
+            } catch (err) { /* non-fatal */ }
+            return;
+        }
         const response = await fetch("/agents");
         if (!response.ok) {
             agentSelect.innerHTML = "<option>Unable to load agents</option>";
@@ -250,9 +275,86 @@
         }
     }
 
+    let unifiedConversationId = null;
+
+    function renderPermissionCard(action) {
+        const card = document.createElement("div");
+        card.className = "chat-suggestion permission-card";
+        const tool = action.tool_name || "tool";
+        const reason = action.reason || "";
+        const header = document.createElement("div");
+        header.innerHTML = `<b>Permission needed:</b> <code>${tool}</code><br /><span class="chat-meta">${reason}</span>`;
+        card.appendChild(header);
+        const buttons = document.createElement("div");
+        buttons.style.marginTop = "8px";
+        (action.actions || []).forEach((btn) => {
+            const el = document.createElement("button");
+            el.className = "btn btn-ghost";
+            el.style.marginRight = "6px";
+            el.textContent = btn.label;
+            el.addEventListener("click", async () => {
+                if (btn.url) {
+                    window.open(btn.url, "_blank");
+                }
+                try {
+                    const resp = await fetch(`/chat/permission/${action.request_id}`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ decision: btn.decision }),
+                    });
+                    const payload = await resp.json();
+                    addMessage(payload.message || "(done)", "agent", `permission: ${btn.decision}`);
+                } catch (err) {
+                    addMessage("(failed to update permission)", "agent", null);
+                }
+            });
+            buttons.appendChild(el);
+        });
+        card.appendChild(buttons);
+        return card;
+    }
+
+    async function sendMessageUnified(message) {
+        addMessage(message, "user", null);
+        chatInput.value = "";
+        chatStatus.textContent = "Thinking...";
+        try {
+            const response = await fetch("/chat/message", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: message,
+                    conversation_id: unifiedConversationId,
+                }),
+            });
+            if (!response.ok) {
+                chatStatus.textContent = "Failed to send message.";
+                addMessage("(error: chat service unavailable)", "agent", null);
+                return;
+            }
+            const payload = await response.json();
+            unifiedConversationId = payload.conversation_id || unifiedConversationId;
+            const meta = payload.intent ? `intent: ${payload.intent}` : null;
+            const bubble = addMessage(payload.text, "agent", meta);
+            (payload.actions || []).forEach((action) => {
+                if (action.type === "permission_request") {
+                    bubble.appendChild(renderPermissionCard(action));
+                }
+            });
+            chatStatus.textContent = "Ready";
+        } catch (err) {
+            chatStatus.textContent = "Network error.";
+            addMessage("(network error)", "agent", null);
+        }
+    }
+
     async function sendMessage() {
         const message = chatInput.value.trim();
         if (!message) {
+            return;
+        }
+        if (UNIFIED_CHAT_ENABLED) {
+            await sendMessageUnified(message);
             return;
         }
         const agentId = agentSelect.value;

@@ -8,15 +8,27 @@
 
     <div class="info-panel">
         <h2>Global Settings</h2>
+        {% if secrets_env_only %}
+        <div style="background:#fff8e1; border-left:4px solid #f0b400; padding:12px; margin-bottom:12px;">
+            <b>Secrets locked:</b> <code>SECRETS_ENV_ONLY</code> is on.
+            The Telegram bot token and provider API keys must be set via
+            environment variables (<code>TELEGRAM_BOT_TOKEN</code>,
+            <code>OPENAI_API_KEY</code>, <code>GEMINI_API_KEY</code>) on the server.
+            Those fields are hidden below.
+        </div>
+        {% endif %}
         <form class="form-stack" method="post" action="/admin/panel/settings">
+            {% if not secrets_env_only %}
             <label>
                 <span>Telegram bot token</span>
                 <input type="text" name="telegram_bot_token" placeholder="{{ masked_settings.get('telegram_bot_token', 'not set') }}" />
             </label>
+            {% endif %}
             <label>
                 <span>Telegram bot username</span>
                 <input type="text" name="telegram_bot_username" value="{{ settings.get('telegram_bot_username', '') }}" />
             </label>
+            {% if not secrets_env_only %}
             <label>
                 <span>OpenAI API key</span>
                 <input type="text" name="openai_api_key" placeholder="{{ masked_settings.get('openai_api_key', 'not set') }}" />
@@ -25,6 +37,7 @@
                 <span>Gemini API key</span>
                 <input type="text" name="gemini_api_key" placeholder="{{ masked_settings.get('gemini_api_key', 'not set') }}" />
             </label>
+            {% endif %}
             <label>
                 <span>Default model provider</span>
                 <input type="text" name="default_model_provider" placeholder="openai or gemini" value="{{ settings.get('default_model_provider', '') }}" />

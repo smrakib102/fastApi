@@ -24,6 +24,8 @@ def _get_bot_token(db: Session) -> str | None:
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_token")
     ).scalar_one_or_none()
+    if settings.secrets_env_only:
+        return settings.telegram_bot_token
     return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
 
 
@@ -137,10 +139,23 @@ def request_tool_access(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_user),
 ):
-    request = ToolRequest(user_id=current_user.id, tool_name=tool_name, details=details)
-    db.add(request)
+    # Patch P5: route through PermissionService instead of constructing
+    # ToolRequest directly. This collapses request creation onto a single
+    # path so duplicate-pending detection and "already authorized"
+    # short-circuiting work uniformly across surfaces.
+    from app.services.permission_service import permission_service
+
+    pr = permission_service.request(
+        db,
+        user=current_user,
+        tool_name=tool_name,
+        reason=details or f"Tool access for {tool_name}",
+    )
     db.commit()
-    db.refresh(request)
+
+    if pr.request_id == 0:
+        # Already authorized — nothing more to do, mirror legacy shape.
+        return {"ok": True, "request_id": 0, "status": "already_authorized"}
 
     link = db.execute(
         select(TelegramLink).where(TelegramLink.user_id == current_user.id)
@@ -149,11 +164,11 @@ def request_tool_access(
         keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "Connect OAuth", "callback_data": f"toolreq:oauth:{request.id}"},
-                    {"text": "Add API key", "callback_data": f"toolreq:apikey:{request.id}"},
+                    {"text": "Connect OAuth", "callback_data": f"toolreq:oauth:{pr.request_id}"},
+                    {"text": "Add API key", "callback_data": f"toolreq:apikey:{pr.request_id}"},
                 ],
                 [
-                    {"text": "Skip", "callback_data": f"toolreq:skip:{request.id}"},
+                    {"text": "Skip", "callback_data": f"toolreq:skip:{pr.request_id}"},
                 ],
             ]
         }
@@ -168,7 +183,7 @@ def request_tool_access(
             parse_mode="HTML",
         )
 
-    return {"ok": True, "request_id": request.id}
+    return {"ok": True, "request_id": pr.request_id}
 
 
 @router.post("/setkey")

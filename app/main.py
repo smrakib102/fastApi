@@ -9,6 +9,7 @@ from app.api.routes import (
 	admin,
 	auth,
 	calendar,
+	chat,
 	gmail,
 	google_oauth,
 	health,
@@ -23,6 +24,7 @@ from app.api.routes import (
 	tools,
 	usage,
 	ui,
+	workflows,
 )
 from app.core.config import settings
 
@@ -50,3 +52,17 @@ app.include_router(teams.router, prefix="/teams", tags=["teams"])
 app.include_router(usage.router, prefix="/usage", tags=["usage"])
 app.include_router(summaries.router, prefix="/summaries", tags=["summaries"])
 app.include_router(insights.router, prefix="/insights", tags=["insights"])
+# Phase 2c: unified chat HTTP API (gated by UNIFIED_CHAT_ENABLED).
+app.include_router(chat.router, prefix="/chat", tags=["chat"])
+# Phase 6: workflow engine HTTP API (gated by WORKFLOW_ENGINE_ENABLED).
+app.include_router(workflows.router, prefix="/workflows", tags=["workflows"])
+
+
+# Phase 5: discover plugins at startup when enabled. Failures are logged
+# inside discover() and never abort boot.
+@app.on_event("startup")
+def _discover_plugins() -> None:
+    if settings.plugin_loader_enabled:
+        from app.plugins import plugin_registry
+
+        plugin_registry.discover()

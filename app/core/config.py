@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     google_oauth_client_secret: str | None = None
     google_oauth_redirect_uri: str | None = None
     google_oauth_scopes: str | None = None
+    # Phase 8: external base URL used to build Telegram → web bridge links
+    # (e.g. https://app.example.com). Falls back to the redirect_uri host.
+    public_base_url: str | None = None
     telegram_bot_token: str | None = None
     telegram_webhook_secret: str | None = None
     telegram_bot_username: str | None = None
@@ -72,6 +75,40 @@ class Settings(BaseSettings):
     smtp_tls: bool = True
     smtp_ssl: bool = False
 
+    # --- Phase 0: feature flags for unified chat refactor ---------------------
+    # Master switch for the new ChatService / unified chat pipeline (web + Telegram).
+    # When False, all existing flows behave exactly as before.
+    unified_chat_enabled: bool = False
+    # Sub-flags so phases can be rolled out independently behind the master flag.
+    # NOTE: ``unified_chat_web_enabled`` was retired in the consolidation pass
+    # (Patch P1). The web /chat/message endpoint follows ``unified_chat_enabled``
+    # exclusively now.
+    unified_chat_telegram_enabled: bool = False
+    unified_chat_nl_agent_builder_enabled: bool = False
+    unified_chat_permission_cards_enabled: bool = False
+
+    # --- Phase 7: secrets hardening -----------------------------------------
+    # When True, all provider/bot secrets are read **only** from environment
+    # variables (or container secrets). Admin/Settings UI inputs are rejected
+    # and the corresponding form fields are hidden in templates. This removes
+    # the long-standing risk of secrets being entered through the web UI and
+    # persisted (encrypted) in the DB.
+    secrets_env_only: bool = False
+
+    # --- Phase 5: plugin loader ---------------------------------------------
+    # When True, ``app/plugins/*`` is scanned at startup and tool execution
+    # consults the plugin registry before falling back to the legacy
+    # if/elif chain in app/api/routes/tools.py.
+    # Default flipped to True in Patch P7: gmail/calendar handlers now
+    # exist as plugins (app/plugins/gmail_tools.py, calendar_tools.py).
+    # The legacy if/elif chain remains as a defense-in-depth fallback.
+    plugin_loader_enabled: bool = True
+
+    # --- Phase 6: workflow engine -------------------------------------------
+    # Gates the WorkflowEngine HTTP endpoint and the run_workflow_task
+    # Celery task. The engine itself is import-safe at all times.
+    workflow_engine_enabled: bool = False
+
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -88,6 +125,23 @@ def _validate_settings(config: Settings) -> None:
             raise RuntimeError("tool_api_token is required in staging/production")
         if config.auth_secret_key == "change-me":
             raise RuntimeError("auth_secret_key must be set in staging/production")
+
+    # S4: Prevent split-memory. If the master unified-chat flag is on but
+    # the Telegram sub-flag was forgotten, force it on so both surfaces
+    # land in the same conversations/chat_messages tables. Logged loudly
+    # so operators notice the auto-correction.
+    if config.unified_chat_enabled and not config.unified_chat_telegram_enabled:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "config_auto_enable",
+            extra={
+                "flag": "unified_chat_telegram_enabled",
+                "reason": "unified_chat_enabled=true forces telegram unified mode "
+                "to keep web + Telegram on the same memory pipeline",
+            },
+        )
+        config.unified_chat_telegram_enabled = True
 
 
 _validate_settings(settings)

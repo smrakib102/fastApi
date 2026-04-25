@@ -15,6 +15,7 @@ celery_app = Celery(
 celery_app.conf.task_routes = {
     "app.worker.tasks.run_agent_task": {"queue": "planner"},
     "app.worker.tasks.execute_tool_task": {"queue": "tool_calls"},
+    "app.worker.tasks.run_workflow_task": {"queue": "planner"},
     "app.worker.tasks.approval_wait_task": {"queue": "approvals"},
     "app.worker.tasks.send_summaries": {"queue": "long_jobs"},
     "app.worker.tasks.record_worker_heartbeat": {"queue": "default"},
