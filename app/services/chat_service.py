@@ -31,7 +31,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.ai_keys import get_default_provider, get_user_key
@@ -115,10 +115,126 @@ def _render_run_result(agent: Agent, run) -> str:
     return f"✅ {agent.name} finished ({status}).\n\n{output}"
 
 
+# --- Operator persona ------------------------------------------------------
+# OpenClaw is an *agent automation platform*, not a chatbot. The base persona
+# is intentionally strict: never list generic LLM abilities, always answer in
+# terms of agents / automations / integrations, and finish capability or help
+# style answers with one concrete CTA.
+OPERATOR_BASE_PERSONA = (
+    "You are OpenClaw — the operator console of an AI agent automation "
+    "platform. You are NOT a general-purpose chatbot, NOT ChatGPT, and NOT "
+    "an LLM concierge. Your job is to help the user create, run, and "
+    "manage automation agents.\n\n"
+    "HARD RULES:\n"
+    "1. Never describe yourself as 'an AI', 'a large language model', "
+    "'a virtual assistant', or list generic LLM abilities (translation, "
+    "writing poems, answering trivia, etc.) as your features.\n"
+    "2. When asked what you can do, what your features are, how this "
+    "works, or for help, answer ONLY in terms of OpenClaw capabilities: "
+    "creating agents, running agents, automating Gmail / Calendar / "
+    "Telegram tasks, scheduled summaries, approvals, and tool "
+    "integrations. End with one concrete next-step suggestion (e.g. "
+    "'try: create an agent that summarizes my unread emails').\n"
+    "3. Default to short replies — 1 to 3 sentences. Use bullets only "
+    "when the user explicitly asks for a list or steps are required.\n"
+    "4. Small tasks the user clearly wants done (translate this line, "
+    "rewrite this sentence, summarize this paragraph) → just do them, "
+    "then optionally add one short line: 'want me to turn this into "
+    "an agent?'\n"
+    "5. If a request needs an integration the user hasn't connected, "
+    "say so plainly and point them to the Tools page or /tools.\n"
+    "6. Tone: professional, concise, action-oriented. No filler.\n"
+)
+
+
+def _build_user_context(db: Session, user_id: int) -> str:
+    """Render a short live-state block to inject into the system prompt.
+
+    Keeps queries cheap (counts only) and silently degrades on error so a
+    DB hiccup never blocks chat replies.
+    """
+    try:
+        agent_count = db.execute(
+            select(func.count(Agent.id)).where(Agent.user_id == user_id)
+        ).scalar() or 0
+    except Exception:  # noqa: BLE001 — never block chat on context lookup
+        agent_count = 0
+
+    google_connected = False
+    try:
+        from app.models.google_account import GoogleAccount  # local import
+
+        google_connected = bool(
+            db.execute(
+                select(GoogleAccount.id).where(GoogleAccount.user_id == user_id).limit(1)
+            ).scalar()
+        )
+    except Exception:  # noqa: BLE001
+        google_connected = False
+
+    telegram_linked = False
+    try:
+        from app.models.telegram_link import TelegramLink  # local import
+
+        telegram_linked = bool(
+            db.execute(
+                select(TelegramLink.id).where(TelegramLink.user_id == user_id).limit(1)
+            ).scalar()
+        )
+    except Exception:  # noqa: BLE001
+        telegram_linked = False
+
+    tools = []
+    if google_connected:
+        tools.extend(["Gmail", "Google Calendar"])
+    if telegram_linked:
+        tools.append("Telegram")
+    tools_str = ", ".join(tools) if tools else "none yet"
+
+    if agent_count == 0:
+        bias = (
+            "This user has 0 agents — bias every reply toward onboarding "
+            "and first-agent creation."
+        )
+    elif agent_count <= 2:
+        bias = (
+            "This user is early-stage with a few agents — encourage "
+            "running existing agents and creating one more."
+        )
+    else:
+        bias = (
+            "This user is a power user with several agents — skip basic "
+            "onboarding, prefer shortcuts and direct actions."
+        )
+
+    return (
+        "LIVE USER CONTEXT (use to personalize, do not quote verbatim):\n"
+        f"- Agents owned: {agent_count}\n"
+        f"- Connected tools: {tools_str}\n"
+        f"- Guidance: {bias}\n"
+    )
+
+
+_ANTI_PATTERNS = (
+    "as an ai",
+    "as a large language model",
+    "i am an ai",
+    "i'm an ai",
+    "i am a large language model",
+    "i'm a large language model",
+    "as a virtual assistant",
+)
+
+
+def _looks_like_generic_llm(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in _ANTI_PATTERNS)
+
+
 def _llm_reply(
     db: Session, user_id: int, history: list[dict], user_text: str
 ) -> str:
-    """Cheap general-chat LLM call. Uses admin/default provider."""
+    """Operator-style general-chat LLM call. Uses admin/default provider."""
     provider = get_default_provider(db) or "openai"
     api_key = get_user_key(db, user_id, provider)
     if not api_key:
@@ -127,20 +243,8 @@ def _llm_reply(
             "Please ask an admin to set it in the server environment."
         )
 
-    system_prompt = (
-        "You are OpenClaw, a focused work assistant inside the OpenClaw "
-        "agent platform. You help users run agents, draft and send emails, "
-        "manage their calendar, summarize documents, and automate "
-        "multi-step workflows. Be concise, professional, and action-oriented. "
-        "Default to short answers (1-3 sentences). Use bullets only when "
-        "the user explicitly asks for a list or when steps are required. "
-        "When the user asks 'what can you do', briefly highlight the "
-        "platform's actual capabilities — running agents, Gmail, Calendar, "
-        "Telegram automations, scheduled summaries, and approvals — not "
-        "generic LLM features. If a request needs a tool the user hasn't "
-        "connected yet, say so plainly and suggest connecting it from the "
-        "Tools page. Never claim to be 'just an AI'."
-    )
+    user_context = _build_user_context(db, user_id)
+    system_prompt = OPERATOR_BASE_PERSONA + "\n" + user_context
 
     messages = (
         [{"role": "system", "content": system_prompt}]
@@ -148,14 +252,38 @@ def _llm_reply(
         + [{"role": "user", "content": user_text}]
     )
 
-    try:
+    def _call() -> str:
         if provider == "gemini":
-            # Gemini helper takes a flat prompt; flatten history for now.
+            # Gemini helper takes a flat prompt; flatten messages for now.
             prompt_parts = [f"{m['role']}: {m['content']}" for m in messages]
-            text, _tokens = call_gemini(api_key, "gemini-2.5-flash", "\n".join(prompt_parts))
-            return text.strip() or "(no response)"
+            text, _tokens = call_gemini(
+                api_key, "gemini-2.5-flash", "\n".join(prompt_parts)
+            )
+            return (text or "").strip()
         text, _tokens = call_openai_chat(api_key, "gpt-4o-mini", messages)
-        return text.strip() or "(no response)"
+        return (text or "").strip()
+
+    try:
+        reply = _call()
+        # Soft guardrail: if the model still produced a generic-LLM reply,
+        # retry once with a stricter nudge before giving up.
+        if _looks_like_generic_llm(reply):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Your previous reply sounded like a generic AI "
+                        "assistant. Rewrite it as the OpenClaw operator: "
+                        "answer only in terms of agents and automations, "
+                        "never call yourself an AI, and keep it to 1-3 "
+                        "short sentences with one concrete next step."
+                    ),
+                }
+            )
+            retry = _call()
+            if retry:
+                reply = retry
+        return reply or "(no response)"
     except LLMError as exc:
         logger.warning(
             "chat_service_llm_error provider=%s error=%s", provider, exc,
