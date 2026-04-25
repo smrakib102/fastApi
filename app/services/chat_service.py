@@ -138,7 +138,10 @@ def _llm_reply(
         text, _tokens = call_openai_chat(api_key, "gpt-4o-mini", messages)
         return text.strip() or "(no response)"
     except LLMError as exc:
-        logger.warning("chat_service_llm_error", extra={"error": str(exc), "provider": provider})
+        logger.warning(
+            "chat_service_llm_error provider=%s error=%s", provider, exc,
+            extra={"error": str(exc), "provider": provider},
+        )
         return "Sorry — I couldn't reach the model right now. Please try again in a moment."
 
 
