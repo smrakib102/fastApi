@@ -133,7 +133,7 @@ def _llm_reply(
         if provider == "gemini":
             # Gemini helper takes a flat prompt; flatten history for now.
             prompt_parts = [f"{m['role']}: {m['content']}" for m in messages]
-            text, _tokens = call_gemini(api_key, "gemini-1.5-flash", "\n".join(prompt_parts))
+            text, _tokens = call_gemini(api_key, "gemini-2.5-flash", "\n".join(prompt_parts))
             return text.strip() or "(no response)"
         text, _tokens = call_openai_chat(api_key, "gpt-4o-mini", messages)
         return text.strip() or "(no response)"

@@ -11,7 +11,7 @@ from app.models.telegram_message import TelegramMessage
 from app.services.usage_limits import check_and_record_usage
 
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
-GEMINI_DEFAULT_MODEL = "gemini-1.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 
 def _get_provider(db: Session, user_id: int) -> tuple[str, str]:

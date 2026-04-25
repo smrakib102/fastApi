@@ -163,7 +163,7 @@ def _call_llm(db: Session, user_id: int, user_text: str, tools_block: str) -> Op
         if provider == "gemini":
             text, _ = call_gemini(
                 api_key,
-                "gemini-1.5-flash",
+                "gemini-2.5-flash",
                 f"{_BUILDER_SYSTEM}\n\n{user_prompt}",
             )
         else:

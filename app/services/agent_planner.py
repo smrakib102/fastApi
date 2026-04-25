@@ -13,7 +13,7 @@ from app.models.agent import Agent
 from app.services.usage_limits import check_and_record_usage
 
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
-GEMINI_DEFAULT_MODEL = "gemini-1.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 logger = logging.getLogger(__name__)
 
@@ -557,7 +557,7 @@ def _estimate_cost(provider: str, model: str, tokens: int) -> float:
             "gpt-4o-mini": 0.00015,
         },
         "gemini": {
-            "gemini-1.5-flash": 0.0001,
+            "gemini-2.5-flash": 0.0001,
         },
     }
     default_rate = 0.0001
