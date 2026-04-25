@@ -29,6 +29,32 @@ services:
       - redisdata:/data
     restart: unless-stopped
 
+  worker:
+    build: .
+    working_dir: /app
+    command: celery -A app.worker.celery_app worker -Q planner,tool_calls,long_jobs,approvals,default --concurrency=4 --loglevel=info
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  beat:
+    build: .
+    working_dir: /app
+    command: celery -A app.worker.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
