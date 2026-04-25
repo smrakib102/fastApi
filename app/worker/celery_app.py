@@ -10,6 +10,7 @@ celery_app = Celery(
     "agent_worker",
     broker=settings.redis_url,
     backend=settings.redis_url,
+    include=["app.worker.tasks"],
 )
 
 celery_app.conf.task_routes = {
