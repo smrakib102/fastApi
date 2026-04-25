@@ -28,7 +28,13 @@ from app.api.routes import (
 )
 from app.core.config import settings
 
-app = FastAPI(title=settings.app_name)
+_is_prod = settings.environment in {"staging", "production"}
+app = FastAPI(
+    title=settings.app_name,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
