@@ -331,6 +331,7 @@ def dashboard_run_agent(
 def chat_page(
     request: Request,
     current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
@@ -339,6 +340,34 @@ def chat_page(
     from app.core.config import settings as _settings  # local import to avoid cycles
 
     unified_enabled = bool(_settings.unified_chat_enabled)
+
+    # Auto-provision a default assistant for new users so the chat page
+    # always has an agent to talk to instead of dead-ending in the wizard.
+    if not unified_enabled:
+        agent_count = db.execute(
+            select(func.count(Agent.id)).where(Agent.user_id == current_user.id)
+        ).scalar()
+        if not agent_count:
+            base_name = f"Default Assistant - {current_user.email or current_user.id}"
+            unique_name = base_name
+            suffix = 1
+            while db.execute(
+                select(Agent.id).where(Agent.name == unique_name)
+            ).scalar_one_or_none():
+                suffix += 1
+                unique_name = f"{base_name} #{suffix}"
+            default_agent = Agent(
+                user_id=current_user.id,
+                name=unique_name,
+                role="general assistant",
+                model="auto",
+                tools=json.dumps([]),
+                category="general",
+                status="active",
+            )
+            db.add(default_agent)
+            db.commit()
+
     return templates.TemplateResponse(
         "chat.html",
         {

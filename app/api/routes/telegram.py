@@ -235,6 +235,72 @@ def telegram_status(
     }
 
 
+@router.post("/admin/set-webhook")
+def set_telegram_webhook(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Register this server's /telegram/webhook URL with Telegram so the
+    bot starts receiving /start and other commands. Idempotent."""
+    bot_token = _get_bot_token(db)
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
+    if not settings.telegram_webhook_secret:
+        raise HTTPException(status_code=400, detail="telegram_webhook_secret not configured")
+    if not settings.public_base_url:
+        raise HTTPException(status_code=400, detail="public_base_url not configured")
+
+    webhook_url = settings.public_base_url.rstrip("/") + "/telegram/webhook"
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/setWebhook",
+            json={
+                "url": webhook_url,
+                "secret_token": settings.telegram_webhook_secret,
+                "drop_pending_updates": True,
+                "allowed_updates": ["message", "edited_message", "callback_query"],
+            },
+            timeout=20,
+        )
+        data = resp.json()
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.exception("telegram_set_webhook_failed")
+        raise HTTPException(status_code=502, detail=f"telegram_api_error: {exc}")
+
+    if not data.get("ok"):
+        logger.error("telegram_set_webhook_rejected", extra={"response": data})
+        raise HTTPException(status_code=502, detail=data)
+
+    record_audit(
+        db,
+        user_id=current_user.id,
+        action="telegram.webhook_set",
+        resource_type="telegram_bot",
+        resource_id=None,
+        metadata={"webhook_url": webhook_url},
+    )
+    return {"ok": True, "webhook_url": webhook_url, "telegram_response": data}
+
+
+@router.get("/admin/webhook-info")
+def telegram_webhook_info(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Return Telegram's view of the currently registered webhook (for debugging)."""
+    bot_token = _get_bot_token(db)
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
+    try:
+        resp = httpx.get(
+            f"https://api.telegram.org/bot{bot_token}/getWebhookInfo",
+            timeout=20,
+        )
+        return resp.json()
+    except Exception as exc:  # pragma: no cover - network failure path
+        raise HTTPException(status_code=502, detail=f"telegram_api_error: {exc}")
+
+
 @router.post("/webhook")
 def telegram_webhook(
     update: dict,
