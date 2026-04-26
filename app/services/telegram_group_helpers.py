@@ -21,10 +21,11 @@ from __future__ import annotations
 from typing import Any
 
 
-# Telegram-supported admin rights flags. We request only what's needed
-# to (a) read the group and (b) post the summary back if the user
-# eventually wants in-group delivery. Users can edit them in the popup.
-_DEFAULT_GROUP_ADMIN_RIGHTS = "post_messages+delete_messages+invite_users"
+# Telegram-supported admin rights flags. We request only what's valid
+# for *groups* — `post_messages` / `edit_messages` are channel-only and
+# cause Telegram to throw "Could not add user" when used with a group.
+# Users can edit the checkbox set in the popup before confirming.
+_DEFAULT_GROUP_ADMIN_RIGHTS = "delete_messages+pin_messages+invite_users"
 
 
 def build_group_invite_link(bot_username: str | None) -> str | None:

@@ -256,6 +256,42 @@ def _ensure_unique_name(db: Session, base_name: str) -> str:
     return name
 
 
+def _find_incomplete_agent(
+    db: Session, user_id: int, proposed_name: str, spec: "AgentSpec", raw_text: str
+) -> Agent | None:
+    """Return the most recent agent owned by this user that matches the
+    proposed name AND is in an incomplete setup state, else None.
+
+    Today the only "incomplete" state we track is: a Telegram-group
+    agent whose config has no ``telegram_chat_id`` bound. When that
+    matches we ask the user whether to resume or discard — instead of
+    silently renaming the new agent to "<name> 2".
+    """
+    import json as _json
+
+    needs_group = _agent_needs_telegram_group(spec, raw_text)
+    if not needs_group:
+        return None
+
+    candidates = (
+        db.execute(
+            select(Agent)
+            .where(Agent.user_id == user_id, Agent.name.ilike(proposed_name))
+            .order_by(Agent.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    for candidate in candidates:
+        try:
+            cfg = _json.loads(candidate.config) if candidate.config else {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        if not cfg.get("telegram_chat_id"):
+            return candidate
+    return None
+
+
 # ---- Telegram-group convenience helpers ----------------------------------
 # Surfaced in the post-create confirmation when the agent looks like it
 # needs to read or post in a Telegram group, so the user gets a one-tap
@@ -406,6 +442,30 @@ class AgentBuilder:
             spec = _spec_fallback(text)
         else:
             spec = _spec_from_llm(data, text, available_names)
+
+        # ---- Resume incomplete prior creation? -----------------------------
+        # If this user already has an agent with the same proposed name
+        # and it's still incomplete (telegram-group agent without a bound
+        # chat), don't silently rename to "<name> 2" — ask whether to
+        # resume or discard. The user's reply (button tap) is handled by
+        # the channel layer; we just emit the action.
+        existing_incomplete = _find_incomplete_agent(db, user.id, spec.name, spec, text)
+        if existing_incomplete is not None:
+            return BuildResult(
+                status="needs_clarification",
+                text=(
+                    f"⚠️ You already have an agent named <b>{existing_incomplete.name}</b> "
+                    "that wasn't fully set up yet (no group is bound).\n\n"
+                    "Do you want to continue setting it up, or delete it and start over?"
+                ),
+                actions=[
+                    {
+                        "type": "agent_resume_prompt",
+                        "agent_id": existing_incomplete.id,
+                        "agent_name": existing_incomplete.name,
+                    }
+                ],
+            )
 
         # Persist
         spec.name = _ensure_unique_name(db, spec.name)

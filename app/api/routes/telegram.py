@@ -479,7 +479,7 @@ def set_telegram_webhook(
                 "url": webhook_url,
                 "secret_token": settings.telegram_webhook_secret,
                 "drop_pending_updates": True,
-                "allowed_updates": ["message", "edited_message", "callback_query"],
+                "allowed_updates": ["message", "edited_message", "callback_query", "my_chat_member"],
             },
             timeout=20,
         )
@@ -615,7 +615,47 @@ def telegram_webhook(
 
     callback = _extract_callback(update)
     message = _extract_message(update)
-    if not message and not callback:
+    my_chat_member = update.get("my_chat_member")
+    if not message and not callback and not my_chat_member:
+        return {"ok": True}
+
+    # ---- Bot was added/removed from a group ------------------------------
+    # Telegram doesn't auto-redirect the user back to our DM after they
+    # add us, so we proactively DM them so the flow doesn't feel broken.
+    if my_chat_member and not callback:
+        try:
+            new_status = (my_chat_member.get("new_chat_member") or {}).get("status")
+            old_status = (my_chat_member.get("old_chat_member") or {}).get("status")
+            chat_blob = my_chat_member.get("chat") or {}
+            chat_kind = chat_blob.get("type")
+            group_chat_id = chat_blob.get("id")
+            group_title = chat_blob.get("title") or "your group"
+            adder = my_chat_member.get("from") or {}
+            adder_tg_id = str(adder.get("id") or "")
+
+            became_member = (
+                new_status in {"member", "administrator"}
+                and old_status in {None, "left", "kicked"}
+                and chat_kind in {"group", "supergroup"}
+            )
+            if became_member and adder_tg_id:
+                link = db.execute(
+                    select(TelegramLink).where(
+                        TelegramLink.telegram_user_id == adder_tg_id
+                    )
+                ).scalar_one_or_none()
+                if link and link.telegram_user_id:
+                    _send_message(
+                        db,
+                        str(link.telegram_user_id),
+                        f"✅ I'm in <b>{group_title}</b>!\n\n"
+                        "Open our chat and say <code>run &lt;agent name&gt;</code> "
+                        "to bind this group to your agent.",
+                    )
+        except Exception:  # noqa: BLE001 — best-effort notice
+            logger.exception(
+                "telegram_my_chat_member_handle_failed"
+            )
         return {"ok": True}
 
     if callback:
@@ -707,6 +747,115 @@ def telegram_webhook(
                 _send_message(db, str(chat_id), confirmation)
             if callback_id:
                 _answer_callback(db, callback_id, agent.name)
+            return {"ok": True}
+
+        # ---- Resume / discard incomplete agent ---------------------------
+        if parts[0] in {"resume", "discard"} and len(parts) >= 2:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id_int = int(parts[1])
+            except ValueError:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+            agent = db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id_int, Agent.user_id == user_id
+                )
+            ).scalar_one_or_none()
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+
+            if parts[0] == "discard":
+                from app.services.agent_deleter import delete_agent_cascade
+
+                deleted_name = None
+                if agent is not None:
+                    try:
+                        deleted_name = delete_agent_cascade(
+                            db, user_id=user_id, agent_id=agent_id_int
+                        )
+                        db.commit()
+                    except Exception:  # noqa: BLE001
+                        db.rollback()
+                        logger.exception(
+                            "agent_discard_failed",
+                            extra={"user_id": user_id, "agent_id": agent_id_int},
+                        )
+                        if callback_id:
+                            _answer_callback(db, callback_id, "Delete failed")
+                        return {"ok": True}
+                confirmation = (
+                    f"🗑 Deleted <b>{deleted_name}</b>. Send your "
+                    "create-agent message again to start fresh."
+                    if deleted_name
+                    else "That agent was already gone. Send your create-agent message again."
+                )
+                if message_id is not None:
+                    _edit_message_text(
+                        db,
+                        str(chat_id),
+                        int(message_id),
+                        confirmation,
+                        reply_markup={"inline_keyboard": []},
+                    )
+                else:
+                    _send_message(db, str(chat_id), confirmation)
+                if callback_id:
+                    _answer_callback(db, callback_id, "Deleted")
+                return {"ok": True}
+
+            # parts[0] == "resume" → re-render the group picker for this agent.
+            if agent is None:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Agent not found")
+                _send_message(
+                    db,
+                    str(chat_id),
+                    "I couldn't find that agent anymore. Try creating it again.",
+                )
+                return {"ok": True}
+            from app.services.agent_builder import (
+                _build_telegram_group_picker_action,
+            )
+
+            picker = _build_telegram_group_picker_action(
+                db, user_id, agent.id, agent.name
+            )
+            if message_id is not None:
+                _edit_message_text(
+                    db,
+                    str(chat_id),
+                    int(message_id),
+                    f"Resuming setup for <b>{agent.name}</b>…",
+                    reply_markup={"inline_keyboard": []},
+                )
+            if picker:
+                _render_telegram_group_picker(
+                    db,
+                    str(chat_id),
+                    int(picker.get("agent_id")),
+                    str(picker.get("prompt") or "Pick a group"),
+                    list(picker.get("groups") or []),
+                    picker.get("invite_url"),
+                )
+            else:
+                _send_message(
+                    db,
+                    str(chat_id),
+                    "I can't render the group picker right now. Add me to a "
+                    "group manually and try <code>run "
+                    f"{agent.name}</code>.",
+                )
+            if callback_id:
+                _answer_callback(db, callback_id, "Resumed")
             return {"ok": True}
 
         # ---- Telegram group picker (after agent create) ------------------
@@ -1635,6 +1784,34 @@ def telegram_webhook(
                         except Exception:  # noqa: BLE001
                             logger.exception(
                                 "telegram_group_picker_render_failed",
+                                extra={"chat_id": str(chat_id)},
+                            )
+                    elif a_type == "agent_resume_prompt":
+                        try:
+                            agent_id_int = int(action.get("agent_id"))
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [
+                                        {
+                                            "text": "✅ Yes, continue setup",
+                                            "callback_data": f"resume:{agent_id_int}",
+                                        },
+                                        {
+                                            "text": "🗑 No, delete it",
+                                            "callback_data": f"discard:{agent_id_int}",
+                                        },
+                                    ]
+                                ]
+                            }
+                            _send_message(
+                                db,
+                                str(chat_id),
+                                "Pick one:",
+                                reply_markup=keyboard,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "telegram_resume_prompt_render_failed",
                                 extra={"chat_id": str(chat_id)},
                             )
         except Exception:  # noqa: BLE001 — never break the webhook
