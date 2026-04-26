@@ -87,6 +87,7 @@ class BuildResult:
     spec: Optional[AgentSpec] = None
     agent_id: Optional[int] = None
     missing_tools: list[str] = field(default_factory=list)
+    actions: list[dict] = field(default_factory=list)
 
 
 # ---- prompt template -------------------------------------------------------
@@ -274,7 +275,12 @@ _TELEGRAM_GROUP_HINTS = (
 
 
 def _agent_needs_telegram_group(spec: AgentSpec, raw_text: str) -> bool:
-    """Heuristic: does this agent need to be added to a Telegram group?"""
+    """Heuristic: does this agent need to be added to a Telegram group?
+
+    We accept either signal — the LLM tagged a telegram tool, or the
+    user's text/role obviously mentions a group. The downstream picker
+    is cancellable, so a false positive just costs the user one tap.
+    """
     blob = " ".join(
         [
             (raw_text or "").lower(),
@@ -287,7 +293,7 @@ def _agent_needs_telegram_group(spec: AgentSpec, raw_text: str) -> bool:
         for t in (spec.tools or []) + (spec.requested_tools or [])
     )
     mentions_group = any(hint in blob for hint in _TELEGRAM_GROUP_HINTS)
-    return has_telegram_tool and mentions_group
+    return has_telegram_tool or mentions_group
 
 
 def _telegram_group_setup_block(db: Session) -> str | None:
@@ -308,6 +314,72 @@ def _telegram_group_setup_block(db: Session) -> str | None:
         "Telegram requires a human admin to add me — this link opens the "
         "native Add-bot dialog with the right permissions pre-checked."
     )
+
+
+def _build_telegram_group_picker_action(
+    db: Session, user_id: int, agent_id: int, agent_name: str
+) -> dict | None:
+    """Return an action payload describing a tappable picker of the user's
+    known Telegram groups + an "add me to a new group" deep link.
+
+    Returns None if there's no bot username configured AND no known
+    groups — caller should fall back to a plain instruction in that case.
+    Channel adapters (currently only Telegram) translate this action
+    into native UI (inline keyboard).
+    """
+    import json as _json
+
+    from app.api.routes.telegram import _get_bot_username
+    from app.models.telegram_message import TelegramMessage
+    from app.services.telegram_group_helpers import build_group_invite_link
+
+    bot_username = _get_bot_username(db)
+    invite_url = build_group_invite_link(bot_username)
+
+    # Distinct (chat_id, chat_type) pairs the user has been seen in
+    # within their groups. Limit to the most recent ~10 to keep the
+    # keyboard usable.
+    rows = db.execute(
+        select(
+            TelegramMessage.chat_id,
+            TelegramMessage.chat_type,
+            TelegramMessage.raw_json,
+        )
+        .where(
+            TelegramMessage.user_id == user_id,
+            TelegramMessage.chat_type.in_(("group", "supergroup")),
+        )
+        .order_by(TelegramMessage.id.desc())
+        .limit(200)
+    ).all()
+
+    seen: dict[str, str] = {}
+    for chat_id, _chat_type, raw in rows:
+        if chat_id in seen:
+            continue
+        title = chat_id  # fallback
+        try:
+            blob = _json.loads(raw or "{}")
+            chat_blob = blob.get("chat") or blob.get("message", {}).get("chat") or {}
+            title = chat_blob.get("title") or chat_id
+        except Exception:  # noqa: BLE001
+            pass
+        seen[chat_id] = title
+        if len(seen) >= 10:
+            break
+
+    groups = [{"chat_id": cid, "title": title} for cid, title in seen.items()]
+    if not groups and not invite_url:
+        return None
+
+    return {
+        "type": "telegram_group_picker",
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "prompt": f"Which group should <b>{agent_name}</b> monitor?",
+        "groups": groups,
+        "invite_url": invite_url,
+    }
 
 
 # ---- public service --------------------------------------------------------
@@ -354,16 +426,30 @@ class AgentBuilder:
                 "available yet. I'll request access in a follow-up step."
             )
 
-        # If the agent involves a Telegram group source, surface a one-tap
-        # invite link so the user doesn't have to hunt through group
-        # settings to add the bot. Telegram doesn't allow bots to invite
-        # themselves, so a single tap is the realistic minimum.
+        # If the agent involves a Telegram group source, surface a tappable
+        # picker of groups the bot already sees, plus a one-tap "add me to a
+        # new group" link. The user picks → we bind the chat_id and create
+        # the schedule. This avoids the "type the chat name" dead-end.
+        actions: list[dict] = []
         if _agent_needs_telegram_group(spec, text):
-            invite_block = _telegram_group_setup_block(db)
-            if invite_block:
-                confirmation += "\n\n" + invite_block
+            picker_action = _build_telegram_group_picker_action(
+                db, user.id, agent.id, agent.name
+            )
+            if picker_action:
+                actions.append(picker_action)
+                confirmation += (
+                    "\n\n<b>One last step:</b> tap the group I should monitor "
+                    "(or add me to a new one)."
+                )
+            else:
+                # Fall back to the plain invite link if we couldn't build
+                # the picker (e.g., bot username not configured).
+                fallback = _telegram_group_setup_block(db)
+                if fallback:
+                    confirmation += "\n\n" + fallback
 
-        confirmation += f"\n\nSay “run {spec.name}” to start it."
+        if not actions:
+            confirmation += f"\n\nSay “run {spec.name}” to start it."
 
         return BuildResult(
             status="created",
@@ -371,6 +457,7 @@ class AgentBuilder:
             spec=spec,
             agent_id=agent.id,
             missing_tools=missing,
+            actions=actions,
         )
 
     # ---- Phase 8: modify_agent ----------------------------------------

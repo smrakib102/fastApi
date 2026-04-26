@@ -303,6 +303,75 @@ def _render_delete_confirm(
     )
 
 
+def _render_telegram_group_picker(
+    db: Session,
+    chat_id: str,
+    agent_id: int,
+    prompt: str,
+    groups: list[dict],
+    invite_url: str | None,
+) -> None:
+    """Render an inline keyboard listing the user's known Telegram groups
+    plus a one-tap "add me to a new group" URL button.
+
+    Group buttons use callback_data ``grouppick:<agent_id>:<idx>`` —
+    we keep callback_data short (Telegram caps at 64 bytes) and stash
+    the actual chat_id list in Redis under a per-message key.
+    """
+    rows: list[list[dict]] = []
+    # Stash the (idx → chat_id) map in Redis so the callback handler can
+    # resolve it. We avoid putting chat_ids directly in callback_data
+    # because chat_ids can be long negatives (-100…) and we'd blow the
+    # 64-byte cap quickly when combined with the prefix + agent_id.
+    if groups:
+        try:
+            mapping = {str(i): g["chat_id"] for i, g in enumerate(groups)}
+            get_redis().setex(
+                f"telegram:group_pick:{chat_id}:{agent_id}",
+                settings.telegram_prompt_ttl_seconds,
+                json.dumps(mapping),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "telegram_group_pick_store_failed",
+                extra={"chat_id": chat_id, "agent_id": agent_id},
+            )
+
+        for i, g in enumerate(groups[:10]):
+            title = (g.get("title") or g.get("chat_id") or "Group")[:48]
+            rows.append(
+                [
+                    {
+                        "text": f"💬 {title}",
+                        "callback_data": f"grouppick:{agent_id}:{i}",
+                    }
+                ]
+            )
+
+    if invite_url:
+        rows.append(
+            [
+                {
+                    "text": "➕ Add me to a new group",
+                    "url": invite_url,
+                }
+            ]
+        )
+
+    rows.append(
+        [{"text": "Cancel", "callback_data": f"groupcancel:{agent_id}"}]
+    )
+
+    body = prompt
+    if not groups and invite_url:
+        body += (
+            "\n\nI don't see any groups yet. Tap "
+            "<b>Add me to a new group</b> below — "
+            "after I'm added, send /start here and I'll show your groups."
+        )
+    _send_message(db, chat_id, body, reply_markup={"inline_keyboard": rows})
+
+
 # ---- Welcome / help text --------------------------------------------------
 # Telegram auto-linkifies any "/command" token in plain message text, so we
 # can give users a BotFather-style menu just by listing commands here.
@@ -638,6 +707,170 @@ def telegram_webhook(
                 _send_message(db, str(chat_id), confirmation)
             if callback_id:
                 _answer_callback(db, callback_id, agent.name)
+            return {"ok": True}
+
+        # ---- Telegram group picker (after agent create) ------------------
+        if parts[0] == "groupcancel" and len(parts) >= 2:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            if not link:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id_int = int(parts[1])
+            except ValueError:
+                agent_id_int = 0
+            try:
+                get_redis().delete(
+                    f"telegram:group_pick:{chat_id}:{agent_id_int}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            if message_id is not None:
+                _edit_message_text(
+                    db,
+                    str(chat_id),
+                    int(message_id),
+                    "Cancelled. You can run this agent later by typing "
+                    "<code>run &lt;agent name&gt;</code>.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            if callback_id:
+                _answer_callback(db, callback_id, "Cancelled")
+            return {"ok": True}
+
+        if parts[0] == "grouppick" and len(parts) >= 3:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id_int = int(parts[1])
+                idx = parts[2]
+            except (ValueError, IndexError):
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+
+            # Resolve idx → real chat_id from Redis stash.
+            picked_chat_id: str | None = None
+            try:
+                raw = get_redis().get(
+                    f"telegram:group_pick:{chat_id}:{agent_id_int}"
+                )
+                if raw:
+                    mapping = json.loads(raw)
+                    picked_chat_id = mapping.get(str(idx))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "telegram_group_pick_load_failed",
+                    extra={"chat_id": str(chat_id), "agent_id": agent_id_int},
+                )
+
+            if not picked_chat_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Selection expired")
+                _send_message(
+                    db,
+                    str(chat_id),
+                    "That picker expired. Please re-create the agent or "
+                    "send <code>run &lt;agent name&gt;</code> again.",
+                )
+                return {"ok": True}
+
+            agent = db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id_int, Agent.user_id == user_id
+                )
+            ).scalar_one_or_none()
+            if not agent:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Agent not found")
+                return {"ok": True}
+
+            # Bind chat_id into agent.config (JSON) and create/upsert a
+            # daily SummarySchedule for it.
+            from app.models.summary_schedule import SummarySchedule
+
+            try:
+                cfg = json.loads(agent.config) if agent.config else {}
+            except Exception:  # noqa: BLE001
+                cfg = {}
+            cfg["telegram_chat_id"] = picked_chat_id
+            agent.config = json.dumps(cfg)
+            db.add(agent)
+
+            existing = db.execute(
+                select(SummarySchedule).where(
+                    SummarySchedule.user_id == user_id,
+                    SummarySchedule.chat_id == str(picked_chat_id),
+                )
+            ).scalar_one_or_none()
+            if not existing:
+                schedule = SummarySchedule(
+                    user_id=user_id,
+                    chat_id=str(picked_chat_id),
+                    timezone="UTC",
+                    send_hour=18,
+                    send_minute=0,
+                    active=True,
+                )
+                db.add(schedule)
+            else:
+                existing.active = True
+                db.add(existing)
+
+            try:
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                logger.exception(
+                    "telegram_group_pick_commit_failed",
+                    extra={
+                        "chat_id": str(chat_id),
+                        "agent_id": agent_id_int,
+                        "picked_chat_id": picked_chat_id,
+                    },
+                )
+                if callback_id:
+                    _answer_callback(db, callback_id, "Save failed")
+                return {"ok": True}
+
+            try:
+                get_redis().delete(
+                    f"telegram:group_pick:{chat_id}:{agent_id_int}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            confirmation = (
+                f"✅ <b>{agent.name}</b> is now monitoring this group and will "
+                "DM you a daily summary at 6 PM (UTC).\n\n"
+                "Change the time anytime by saying "
+                "<code>change schedule to 9pm</code>."
+            )
+            if message_id is not None:
+                _edit_message_text(
+                    db,
+                    str(chat_id),
+                    int(message_id),
+                    confirmation,
+                    reply_markup={"inline_keyboard": []},
+                )
+            else:
+                _send_message(db, str(chat_id), confirmation)
+            if callback_id:
+                _answer_callback(db, callback_id, "Bound")
             return {"ok": True}
 
         if parts[0] in {"delpick", "delconfirm"} and len(parts) >= 2:
@@ -1387,6 +1620,21 @@ def telegram_webhook(
                         except Exception:  # noqa: BLE001
                             logger.exception(
                                 "telegram_delete_confirm_render_failed",
+                                extra={"chat_id": str(chat_id)},
+                            )
+                    elif a_type == "telegram_group_picker":
+                        try:
+                            _render_telegram_group_picker(
+                                db,
+                                str(chat_id),
+                                int(action.get("agent_id")),
+                                str(action.get("prompt") or "Pick a group"),
+                                list(action.get("groups") or []),
+                                action.get("invite_url"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "telegram_group_picker_render_failed",
                                 extra={"chat_id": str(chat_id)},
                             )
         except Exception:  # noqa: BLE001 — never break the webhook

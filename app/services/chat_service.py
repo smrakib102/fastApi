@@ -452,9 +452,37 @@ class ChatService:
             )
 
         memory_service.bind_agent(db, conversation, agent.id)
+
+        # If the agent looks Telegram-group-bound but has no chat yet,
+        # show the picker so the user doesn't get a dead-end "type the
+        # group name" reply from the LLM.
+        actions: list[dict] = []
+        try:
+            import json as _json
+
+            cfg = _json.loads(agent.config) if agent.config else {}
+            needs_group = (
+                "telegram" in (agent.role or "").lower()
+                or "group" in (agent.role or "").lower()
+                or "summari" in (agent.role or "").lower()
+            )
+            if needs_group and not cfg.get("telegram_chat_id"):
+                from app.services.agent_builder import (
+                    _build_telegram_group_picker_action,
+                )
+
+                picker = _build_telegram_group_picker_action(
+                    db, user.id, agent.id, agent.name
+                )
+                if picker:
+                    actions.append(picker)
+        except Exception:  # noqa: BLE001 — picker is best-effort
+            pass
+
         return ChatResponse(
             text=_render_run_result(agent, run),
             intent=INTENT_RUN_AGENT,
+            actions=actions,
             data={"agent_id": agent.id, "run_id": run.id},
         )
 
@@ -497,6 +525,10 @@ class ChatService:
             data["missing_tools"] = result.missing_tools
         elif result.missing_tools:
             data["missing_tools"] = result.missing_tools
+        # Carry through any builder-emitted actions (e.g. telegram group
+        # picker) so channel adapters can render them as native UI.
+        if result.actions:
+            actions.extend(result.actions)
         return ChatResponse(
             text=result.text,
             intent=INTENT_CREATE_AGENT,
