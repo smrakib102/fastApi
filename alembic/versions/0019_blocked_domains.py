@@ -1,7 +1,7 @@
 """v4 governance: blocked_domains denylist + seed
 
 Revision ID: 0019_blocked_domains
-Revises: 0018_tool_credentials
+Revises: 0018_tool_credentials_v2
 Create Date: 2026-04-26
 
 Egress denylist consulted later by ``app/services/http_client.py`` (Step 9)
@@ -22,7 +22,7 @@ from sqlalchemy.sql import table, column
 
 
 revision = "0019_blocked_domains"
-down_revision = "0018_tool_credentials"
+down_revision = "0018_tool_credentials_v2"
 branch_labels = None
 depends_on = None
 
