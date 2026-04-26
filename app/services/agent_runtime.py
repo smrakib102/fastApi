@@ -16,6 +16,10 @@ from app.services.agent_memory import build_memory_context, get_recent_steps
 from app.services.agent_planner import generate_plan, plan_recovery_action, summarize_run_context
 from app.services.agent_state import add_step, create_run, finalize_run
 from app.services.agent_tool_router import rank_tools
+from app.services.feature_flags import get_mode
+from app.services.intent_verifier import evaluate as evaluate_intent
+from app.services.tool_call_audit import now_ms, record_tool_call, should_audit
+from app.services.validation_kernel import evaluate as evaluate_validation
 from app.worker.celery_app import celery_app
 
 
@@ -47,6 +51,85 @@ def _parse_direct_tool_call(input_text: str | None) -> dict | None:
             return {"name": parts[1].strip(), "arguments": {}}
 
     return None
+
+
+def _execute_tool_with_audit(
+    db: Session,
+    *,
+    tool_name: str,
+    tool_args: dict,
+    user_id: int,
+    agent_id: int | None,
+    run_id: int | None,
+    step_index: int | None,
+    user_text: str | None,
+    step_thought: str | None,
+    direct_call: bool,
+) -> dict:
+    validation_mode = get_mode("validation_kernel_mode")
+    intent_mode = get_mode("intent_verifier_mode")
+    audit_enabled = should_audit(validation_mode, intent_mode)
+
+    kernel_decisions: dict = {}
+    if validation_mode in {"shadow", "enforce"}:
+        decision = evaluate_validation(tool_name, tool_args)
+        kernel_decisions["validation"] = decision.status
+        kernel_decisions["validation_reasons"] = decision.reasons
+
+    if intent_mode in {"shadow", "enforce"}:
+        decision = evaluate_intent(
+            user_text,
+            tool_name,
+            direct_call=direct_call,
+            step_thought=step_thought,
+        )
+        kernel_decisions["intent"] = decision.status
+        kernel_decisions["intent_reasons"] = decision.reasons
+
+    start = time.monotonic() if audit_enabled else None
+    try:
+        result = execute_tool(db, tool_name, tool_args, user_id, agent_id, retries=1)
+        if audit_enabled:
+            record_tool_call(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                tool_category=None,
+                source="agent",
+                mode="live",
+                args=tool_args,
+                result=result if isinstance(result, dict) else {"result": result},
+                status="ok",
+                error_class=None,
+                error_message=None,
+                latency_ms=now_ms(start),
+                kernel_decisions=kernel_decisions,
+            )
+        return result
+    except ToolExecutionError as exc:
+        if audit_enabled:
+            record_tool_call(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                tool_category=None,
+                source="agent",
+                mode="live",
+                args=tool_args,
+                result=None,
+                status="error",
+                error_class=exc.__class__.__name__,
+                error_message=str(exc),
+                latency_ms=now_ms(start),
+                kernel_decisions=kernel_decisions,
+            )
+        raise
 
 
 def execute_agent_run(
@@ -162,7 +245,18 @@ def _execute_run_loop(
         }
         try:
             start_tool = time.monotonic()
-            result = execute_tool(db, direct_tool["name"], tool_args, user_id, agent.id, retries=1)
+            result = _execute_tool_with_audit(
+                db,
+                tool_name=direct_tool["name"],
+                tool_args=tool_args,
+                user_id=user_id,
+                agent_id=agent.id,
+                run_id=run.id,
+                step_index=1,
+                user_text=input_text,
+                step_thought=None,
+                direct_call=True,
+            )
             tool_elapsed = time.monotonic() - start_tool
             if tool_elapsed > tool_kill_switch_seconds:
                 raise ToolExecutionError("Tool execution exceeded kill switch")
@@ -461,7 +555,18 @@ def _execute_run_loop(
             while attempt <= tool_retry_limit:
                 try:
                     start_tool = time.monotonic()
-                    result = execute_tool(db, selected_tool, tool_args, user_id, agent.id, retries=1)
+                    result = _execute_tool_with_audit(
+                        db,
+                        tool_name=selected_tool,
+                        tool_args=tool_args,
+                        user_id=user_id,
+                        agent_id=agent.id,
+                        run_id=run.id,
+                        step_index=step_number,
+                        user_text=input_text,
+                        step_thought=step_to_execute.thought,
+                        direct_call=False,
+                    )
                     tool_elapsed = time.monotonic() - start_tool
                     if tool_elapsed > tool_kill_switch_seconds:
                         raise ToolExecutionError("Tool execution exceeded kill switch")
