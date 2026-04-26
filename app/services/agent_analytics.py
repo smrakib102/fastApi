@@ -146,10 +146,10 @@ def build_insight_feed(db: Session, user_id: int, agent_id: int | None = None) -
         {
             "tool": tool.tool_name,
             "success_rate": round(float(tool.success_rate or 0.0), 3),
-            "attempts": int(tool.success_count + tool.failure_count),
+            "attempts": int((tool.success_count or 0) + (tool.failure_count or 0)),
         }
         for tool in tools
-        if (tool.success_count + tool.failure_count) >= 2 and (tool.success_rate or 0.0) < 0.5
+        if ((tool.success_count or 0) + (tool.failure_count or 0)) >= 2 and (tool.success_rate or 0.0) < 0.5
     ]
 
     successful_patterns = [
@@ -158,7 +158,7 @@ def build_insight_feed(db: Session, user_id: int, agent_id: int | None = None) -
             "success_rate": round(float(tool.success_rate or 0.0), 3),
         }
         for tool in tools
-        if (tool.success_count + tool.failure_count) >= 3 and (tool.success_rate or 0.0) >= 0.8
+        if ((tool.success_count or 0) + (tool.failure_count or 0)) >= 3 and (tool.success_rate or 0.0) >= 0.8
     ]
 
     improvements: list[str] = []

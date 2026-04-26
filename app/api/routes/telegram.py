@@ -166,6 +166,54 @@ def _send_message(db: Session, chat_id: str, text: str, reply_markup: dict | Non
     )
 
 
+def _send_chat_action(db: Session, chat_id: str, action: str = "typing") -> None:
+    """Tell Telegram to show "... is typing" (or another transient status).
+
+    Telegram displays the action for ~5 seconds or until the next message
+    arrives, whichever is first. Best-effort — never raise.
+    """
+    bot_token = _get_bot_token(db)
+    if not bot_token:
+        return
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/sendChatAction",
+            json={"chat_id": chat_id, "action": action},
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — typing indicator is non-essential
+        logger.debug("telegram_chat_action_failed", extra={"chat_id": str(chat_id)})
+
+
+def _edit_message_text(
+    db: Session,
+    chat_id: str,
+    message_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
+    """Edit a previously-sent inline-keyboard message in place."""
+    bot_token = _get_bot_token(db)
+    if not bot_token:
+        return
+    payload: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/editMessageText",
+            json=payload,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("telegram_edit_failed", extra={"chat_id": str(chat_id)})
+
+
 def _answer_callback(db: Session, callback_id: str, text: str) -> None:
     bot_token = _get_bot_token(db)
     if not bot_token:
@@ -193,6 +241,62 @@ def _send_tool_request(db: Session, chat_id: str, request_id: int, tool_name: st
         db,
         chat_id,
         f"<b>Tool access needed</b>\nTool: <code>{tool_name}</code>\n\nChoose one option below:",
+        reply_markup=keyboard,
+    )
+
+
+# ---- Inline-keyboard helpers for unified ChatService actions --------------
+
+# Telegram caps callback_data at 64 bytes, so we keep payloads tiny:
+#   delpick:<agent_id>      → user picked an agent from the picker
+#   delconfirm:<agent_id>   → user confirmed the destructive action
+#   delcancel               → user cancelled
+
+def _render_agent_picker(
+    db: Session,
+    chat_id: str,
+    prompt: str,
+    agents: list[dict],
+    action: str = "delete",
+) -> None:
+    """Render a list of agents as an inline keyboard for the given action."""
+    if action != "delete":
+        # Only delete is wired today — fall back to plain text for unknown
+        # actions instead of crashing.
+        _send_message(db, chat_id, prompt + "\n(unsupported picker action)")
+        return
+
+    rows: list[list[dict]] = []
+    for a in agents[:25]:  # Telegram inline keyboards: keep it sane
+        agent_id = a.get("id")
+        name = a.get("name") or f"Agent {agent_id}"
+        if agent_id is None:
+            continue
+        rows.append([{"text": f"🗑 {name}", "callback_data": f"delpick:{agent_id}"}])
+    rows.append([{"text": "Cancel", "callback_data": "delcancel"}])
+    _send_message(
+        db,
+        chat_id,
+        f"<b>{prompt}</b>",
+        reply_markup={"inline_keyboard": rows},
+    )
+
+
+def _render_delete_confirm(
+    db: Session, chat_id: str, agent_id: int, agent_name: str
+) -> None:
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Yes, delete", "callback_data": f"delconfirm:{agent_id}"},
+                {"text": "❌ Cancel", "callback_data": "delcancel"},
+            ]
+        ]
+    }
+    _send_message(
+        db,
+        chat_id,
+        f"⚠️ Delete <b>{agent_name}</b>? This cannot be undone.",
         reply_markup=keyboard,
     )
 
@@ -279,7 +383,73 @@ def set_telegram_webhook(
         resource_id=None,
         metadata={"webhook_url": webhook_url},
     )
-    return {"ok": True, "webhook_url": webhook_url, "telegram_response": data}
+
+    # Best-effort: also publish the slash-command menu so users see hints
+    # in their Telegram client. Don't fail the whole call if this errors.
+    commands_result: dict | None = None
+    try:
+        commands_result = _set_bot_commands(bot_token)
+    except Exception:  # noqa: BLE001
+        logger.exception("telegram_set_commands_failed")
+
+    return {
+        "ok": True,
+        "webhook_url": webhook_url,
+        "telegram_response": data,
+        "commands_response": commands_result,
+    }
+
+
+_DEFAULT_BOT_COMMANDS: list[dict] = [
+    {"command": "start", "description": "Link your account / show welcome"},
+    {"command": "help", "description": "Show available commands"},
+    {"command": "agents", "description": "List your agents"},
+    {"command": "newagent", "description": "Create a new agent"},
+    {"command": "run", "description": "Run an agent: /run <name> <prompt>"},
+    {"command": "delete", "description": "Delete one of your agents"},
+    {"command": "summary_now", "description": "Generate an instant summary"},
+]
+
+
+def _set_bot_commands(bot_token: str) -> dict:
+    """Register the slash-command menu Telegram shows in the chat input.
+
+    Idempotent. Returns Telegram's response dict.
+    """
+    resp = httpx.post(
+        f"https://api.telegram.org/bot{bot_token}/setMyCommands",
+        json={"commands": _DEFAULT_BOT_COMMANDS},
+        timeout=15,
+    )
+    return resp.json()
+
+
+@router.post("/admin/set-commands")
+def set_telegram_commands(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """Republish the slash-command menu in Telegram. Useful after editing
+    the command list. Idempotent."""
+    bot_token = _get_bot_token(db)
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
+    try:
+        result = _set_bot_commands(bot_token)
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.exception("telegram_set_commands_failed")
+        raise HTTPException(status_code=502, detail=f"telegram_api_error: {exc}")
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result)
+    record_audit(
+        db,
+        user_id=current_user.id,
+        action="telegram.commands_set",
+        resource_type="telegram_bot",
+        resource_id=None,
+        metadata={"commands": _DEFAULT_BOT_COMMANDS},
+    )
+    return {"ok": True, "commands": _DEFAULT_BOT_COMMANDS, "telegram_response": result}
 
 
 @router.get("/admin/webhook-info")
@@ -345,6 +515,95 @@ def telegram_webhook(
             return {"ok": True}
 
         parts = data.split(":", 2)
+
+        # ---- Agent delete callbacks (from unified ChatService picker) ----
+        if data == "delcancel":
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            if not link:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            if message_id is not None:
+                _edit_message_text(
+                    db, str(chat_id), int(message_id), "Cancelled.", reply_markup={"inline_keyboard": []}
+                )
+            if callback_id:
+                _answer_callback(db, callback_id, "Cancelled")
+            return {"ok": True}
+
+        if parts[0] in {"delpick", "delconfirm"} and len(parts) >= 2:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id = int(parts[1])
+            except ValueError:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+
+            if parts[0] == "delpick":
+                # User picked an agent from the picker → ask to confirm.
+                agent = db.execute(
+                    select(Agent).where(Agent.id == agent_id, Agent.user_id == user_id)
+                ).scalar_one_or_none()
+                if not agent:
+                    if callback_id:
+                        _answer_callback(db, callback_id, "Agent not found")
+                    return {"ok": True}
+                _render_delete_confirm(db, str(chat_id), agent.id, agent.name)
+                if callback_id:
+                    _answer_callback(db, callback_id, agent.name)
+                return {"ok": True}
+
+            # parts[0] == "delconfirm" → actually delete.
+            from app.services.agent_deleter import delete_agent_cascade
+
+            try:
+                deleted_name = delete_agent_cascade(
+                    db, user_id=user_id, agent_id=agent_id
+                )
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                logger.exception(
+                    "agent_delete_failed",
+                    extra={"user_id": user_id, "agent_id": agent_id},
+                )
+                if callback_id:
+                    _answer_callback(db, callback_id, "Delete failed")
+                _send_message(
+                    db,
+                    str(chat_id),
+                    "⚠️ Couldn't delete that agent. Please try again.",
+                )
+                return {"ok": True}
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            confirmation = (
+                f"✅ <b>{deleted_name}</b> deleted."
+                if deleted_name
+                else "That agent was already gone."
+            )
+            if message_id is not None:
+                _edit_message_text(
+                    db, str(chat_id), int(message_id), confirmation, reply_markup={"inline_keyboard": []}
+                )
+            else:
+                _send_message(db, str(chat_id), confirmation)
+            if callback_id:
+                _answer_callback(db, callback_id, "Deleted")
+            return {"ok": True}
+
         if len(parts) < 3 or parts[0] != "toolreq":
             if callback_id:
                 _answer_callback(db, callback_id, "Unsupported action")
@@ -894,6 +1153,9 @@ def telegram_webhook(
     # short-circuit before this block via their own returns.
     # ------------------------------------------------------------------
     if _telegram_unified and text:
+        # Show "... is typing" while we run the model so the user knows
+        # the bot is working. Best-effort — silent on failure.
+        _send_chat_action(db, str(chat_id), "typing")
         try:
             from app.models.user import User as _User  # local import to avoid top-level cycle
             from app.services.chat_service import chat_service as _chat_service
@@ -914,20 +1176,47 @@ def telegram_webhook(
                 # keyboards. Reuses the existing toolreq:* callback handler
                 # since PermissionService writes to the same ToolRequest table.
                 for action in (response.actions or []):
-                    if action.get("type") != "permission_request":
-                        continue
-                    try:
-                        _send_tool_request(
-                            db,
-                            chat_id,
-                            int(action.get("request_id")),
-                            str(action.get("tool_name") or "tool"),
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.exception(
-                            "telegram_permission_render_failed",
-                            extra={"chat_id": str(chat_id)},
-                        )
+                    a_type = action.get("type")
+                    if a_type == "permission_request":
+                        try:
+                            _send_tool_request(
+                                db,
+                                chat_id,
+                                int(action.get("request_id")),
+                                str(action.get("tool_name") or "tool"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "telegram_permission_render_failed",
+                                extra={"chat_id": str(chat_id)},
+                            )
+                    elif a_type == "agent_picker":
+                        try:
+                            _render_agent_picker(
+                                db,
+                                str(chat_id),
+                                str(action.get("prompt") or "Pick an agent"),
+                                list(action.get("agents") or []),
+                                str(action.get("action") or "delete"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "telegram_picker_render_failed",
+                                extra={"chat_id": str(chat_id)},
+                            )
+                    elif a_type == "agent_delete_confirm":
+                        try:
+                            _render_delete_confirm(
+                                db,
+                                str(chat_id),
+                                int(action.get("agent_id")),
+                                str(action.get("agent_name") or "this agent"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "telegram_delete_confirm_render_failed",
+                                extra={"chat_id": str(chat_id)},
+                            )
         except Exception:  # noqa: BLE001 — never break the webhook
             logger.exception(
                 "telegram_chat_service_error",
@@ -955,6 +1244,8 @@ def telegram_webhook(
             "<b>Available commands</b>\n"
             "/run &lt;agent&gt; &lt;prompt&gt; — execute an agent\n"
             "/newagent — create a new agent from a template\n"
+            "/delete — delete one of your agents\n"
+            "/agents — list your agents\n"
             "/summary_now — generate an instant summary\n"
             "/help — show this message",
         )

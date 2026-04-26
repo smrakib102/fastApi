@@ -77,9 +77,12 @@ def insights_dashboard(
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
 
-    agents = db.execute(
+    agent_rows = db.execute(
         select(Agent).where(Agent.user_id == current_user.id).order_by(Agent.created_at.desc())
     ).scalars().all()
+    # Insights template serializes this list with `tojson` for the JS layer,
+    # so we must hand it plain dicts (SQLAlchemy models are not JSON-serializable).
+    agents = [{"id": a.id, "name": a.name} for a in agent_rows]
 
     return templates.TemplateResponse(
         "insights.html",

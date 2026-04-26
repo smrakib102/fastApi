@@ -25,6 +25,7 @@ from typing import Optional
 INTENT_CREATE_AGENT = "create_agent"
 INTENT_RUN_AGENT = "run_agent"
 INTENT_MODIFY_AGENT = "modify_agent"
+INTENT_DELETE_AGENT = "delete_agent"
 INTENT_LIST_AGENTS = "list_agents"
 INTENT_SHOW_RUNS = "show_runs"
 INTENT_TOOL_REQUEST = "tool_request"
@@ -34,6 +35,7 @@ ALL_INTENTS = (
     INTENT_CREATE_AGENT,
     INTENT_RUN_AGENT,
     INTENT_MODIFY_AGENT,
+    INTENT_DELETE_AGENT,
     INTENT_LIST_AGENTS,
     INTENT_SHOW_RUNS,
     INTENT_TOOL_REQUEST,
@@ -110,6 +112,35 @@ _RULES: list[tuple[str, float, re.Pattern, str]] = [
         "modify.behavior",
     ),
 
+    # --- delete_agent ------------------------------------------------------
+    # IMPORTANT: must come before modify_agent rules so "delete the agent"
+    # doesn't get swallowed by modify.verb_object (which doesn't include
+    # the verb 'delete' but is permissive on object words).
+    (
+        INTENT_DELETE_AGENT,
+        0.95,
+        re.compile(r"^/delete\b", re.IGNORECASE),
+        "delete.slash_delete",
+    ),
+    (
+        INTENT_DELETE_AGENT,
+        0.92,
+        re.compile(
+            r"\b(delete|remove|destroy|trash|drop|kill|uninstall)\b.*\b(agent|bot|assistant|workflow)\b",
+            re.IGNORECASE,
+        ),
+        "delete.verb_object",
+    ),
+    (
+        INTENT_DELETE_AGENT,
+        0.85,
+        re.compile(
+            r"\b(delete|remove|destroy|trash|drop)\s+(?:my\s+)?[\"']?([a-z0-9][\w \-]{1,40})[\"']?\s*$",
+            re.IGNORECASE,
+        ),
+        "delete.verb_name",
+    ),
+
     # --- list_agents -------------------------------------------------------
     (
         INTENT_LIST_AGENTS,
@@ -183,7 +214,7 @@ _AGENT_NAME_PATTERNS = [
 
 def _extract_slots(message: str, intent: str) -> dict:
     slots: dict = {}
-    if intent in {INTENT_RUN_AGENT, INTENT_MODIFY_AGENT}:
+    if intent in {INTENT_RUN_AGENT, INTENT_MODIFY_AGENT, INTENT_DELETE_AGENT}:
         for pat in _AGENT_NAME_PATTERNS:
             m = pat.search(message)
             if m:
@@ -195,6 +226,20 @@ def _extract_slots(message: str, intent: str) -> dict:
             slots["agent_ref"] = m.group(1)
             if m.group(2):
                 slots["prompt"] = m.group(2).strip()
+    if intent == INTENT_DELETE_AGENT and "agent_ref" not in slots:
+        # /delete <name> ...
+        m = re.match(r"^/delete\s+(.+)$", message, re.IGNORECASE)
+        if m:
+            slots["agent_ref"] = m.group(1).strip()
+        else:
+            # "delete <name>" or "delete agent <name>" or "delete the bot <name>"
+            m = re.search(
+                r"\b(?:delete|remove|destroy|trash|drop|kill|uninstall)\s+(?:my\s+|the\s+)?(?:agent\s+|bot\s+|assistant\s+|workflow\s+)?[\"']?([a-z0-9][\w \-]{1,60}?)[\"']?\s*$",
+                message,
+                re.IGNORECASE,
+            )
+            if m:
+                slots["agent_ref"] = m.group(1).strip()
     return slots
 
 

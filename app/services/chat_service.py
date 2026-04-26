@@ -45,6 +45,7 @@ from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
 from app.services.permission_service import permission_service
 from app.services.intent_router import (
     INTENT_CREATE_AGENT,
+    INTENT_DELETE_AGENT,
     INTENT_GENERAL_CHAT,
     INTENT_LIST_AGENTS,
     INTENT_MODIFY_AGENT,
@@ -379,6 +380,7 @@ class ChatService:
             INTENT_RUN_AGENT: self._handle_run_agent,
             INTENT_CREATE_AGENT: self._handle_create_agent,
             INTENT_MODIFY_AGENT: self._handle_modify_agent,
+            INTENT_DELETE_AGENT: self._handle_delete_agent,
             INTENT_LIST_AGENTS: self._handle_list_agents,
             INTENT_SHOW_RUNS: self._handle_show_runs,
             INTENT_TOOL_REQUEST: self._handle_tool_request,
@@ -505,6 +507,57 @@ class ChatService:
             text=result.text,
             intent=INTENT_MODIFY_AGENT,
             data=data,
+        )
+
+    # Phase 8b: delete an existing agent. Always confirm via inline picker
+    # / button — never delete on the first turn — so a hallucinated name
+    # match can't destroy the user's agent.
+    def _handle_delete_agent(
+        self, db: Session, user: User, text: str, intent: Intent, conversation
+    ) -> ChatResponse:
+        agents = list(
+            db.execute(
+                select(Agent).where(Agent.user_id == user.id).order_by(Agent.name.asc())
+            )
+            .scalars()
+            .all()
+        )
+        if not agents:
+            return ChatResponse(
+                text="You don't have any agents to delete.",
+                intent=INTENT_DELETE_AGENT,
+            )
+
+        agent_ref = (intent.slots or {}).get("agent_ref")
+        target = _resolve_agent(db, user.id, agent_ref or "") if agent_ref else None
+
+        if target is None:
+            # Render an agent picker (Telegram → inline keyboard, web → buttons).
+            return ChatResponse(
+                text="Which agent should I delete? Pick one:",
+                intent=INTENT_DELETE_AGENT,
+                actions=[
+                    {
+                        "type": "agent_picker",
+                        "action": "delete",
+                        "prompt": "Pick an agent to delete",
+                        "agents": [{"id": a.id, "name": a.name} for a in agents],
+                    }
+                ],
+            )
+
+        # Confirm before destructive action.
+        return ChatResponse(
+            text=f"⚠️ Delete <b>{target.name}</b>? This cannot be undone.",
+            intent=INTENT_DELETE_AGENT,
+            actions=[
+                {
+                    "type": "agent_delete_confirm",
+                    "agent_id": target.id,
+                    "agent_name": target.name,
+                }
+            ],
+            data={"agent_id": target.id},
         )
 
     def _handle_list_agents(
