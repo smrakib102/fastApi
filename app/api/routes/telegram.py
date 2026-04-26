@@ -301,6 +301,52 @@ def _render_delete_confirm(
     )
 
 
+# ---- Welcome / help text --------------------------------------------------
+# Telegram auto-linkifies any "/command" token in plain message text, so we
+# can give users a BotFather-style menu just by listing commands here.
+
+_WELCOME_TEXT = (
+    "👋 <b>Welcome to OpenClaw</b> — your AI agent automation operator.\n"
+    "\n"
+    "I help you create, run, and manage automation agents that work with "
+    "Gmail, Google Calendar, Telegram, and more.\n"
+    "\n"
+    "<b>You can control me by sending these commands:</b>\n"
+    "\n"
+    "/agents — list your agents\n"
+    "/newagent — create a new agent from a template\n"
+    "/run — run an agent: <code>/run &lt;name&gt; &lt;prompt&gt;</code>\n"
+    "/delete — delete one of your agents\n"
+    "/summary_now — generate an instant summary\n"
+    "/help — show this menu again\n"
+    "\n"
+    "<b>Or just chat naturally</b> — try:\n"
+    "• <i>create an agent that summarizes my unread emails</i>\n"
+    "• <i>list all my agents</i>\n"
+    "• <i>delete my old test agent</i>\n"
+)
+
+_HELP_TEXT = (
+    "<b>OpenClaw commands</b>\n"
+    "\n"
+    "/agents — list your agents\n"
+    "/newagent — create a new agent\n"
+    "/run — <code>/run &lt;name&gt; &lt;prompt&gt;</code>\n"
+    "/delete — delete one of your agents\n"
+    "/summary_now — generate an instant summary\n"
+    "/start — show the welcome menu\n"
+    "/help — show this message\n"
+    "\n"
+    "You can also just chat naturally — e.g. <i>“create an agent that drafts "
+    "replies to unread emails every morning”</i>."
+)
+
+
+def _send_welcome(db: Session, chat_id: str) -> None:
+    _send_message(db, chat_id, _WELCOME_TEXT)
+
+
+
 @router.post("/link-token")
 def create_link_token(
     current_user: User = Depends(require_user),
@@ -831,7 +877,8 @@ def telegram_webhook(
     if not linked_user_id:
         logger.warning("telegram_unlinked_block", extra={"chat_id": str(chat_id)})
         if start_token:
-            _send_message(db, chat_id, "Account linked. You can now use bot commands.")
+            _send_message(db, chat_id, "✅ Account linked.")
+            _send_welcome(db, str(chat_id))
         else:
             _send_message(db, chat_id, "Please link your account first via the dashboard.")
         return {"ok": True}
@@ -1143,6 +1190,18 @@ def telegram_webhook(
             _send_message(db, chat_id, f"Created agent <code>{agent.name}</code>.")
             return {"ok": True}
 
+    # ----------------------------------------------------------------------
+    # Linked user just sent /start or /help — show the welcome menu BEFORE
+    # we route to the unified ChatService so it doesn't end up at the LLM.
+    # ----------------------------------------------------------------------
+    stripped_early = (text or "").strip().lower()
+    if stripped_early in {"/start", "/start@" + (_get_bot_username(db) or "").lower()}:
+        _send_welcome(db, str(chat_id))
+        return {"ok": True}
+    if stripped_early in {"/help", "/commands"}:
+        _send_message(db, str(chat_id), _HELP_TEXT)
+        return {"ok": True}
+
     # ------------------------------------------------------------------
     # Phase 2d: Unified ChatService fallback for free-text messages.
     # Gated by UNIFIED_CHAT_TELEGRAM_ENABLED so existing slash-command
@@ -1231,24 +1290,10 @@ def telegram_webhook(
     # above match. Always reply so the bot is never mute.
     stripped = (text or "").strip()
     if stripped == "/start":
-        _send_message(
-            db,
-            chat_id,
-            "You're already linked. Use /help to see available commands.",
-        )
+        _send_welcome(db, str(chat_id))
         return {"ok": True}
     if stripped in {"/help", "/commands"}:
-        _send_message(
-            db,
-            chat_id,
-            "<b>Available commands</b>\n"
-            "/run &lt;agent&gt; &lt;prompt&gt; — execute an agent\n"
-            "/newagent — create a new agent from a template\n"
-            "/delete — delete one of your agents\n"
-            "/agents — list your agents\n"
-            "/summary_now — generate an instant summary\n"
-            "/help — show this message",
-        )
+        _send_message(db, str(chat_id), _HELP_TEXT)
         return {"ok": True}
     if stripped.startswith("/"):
         _send_message(
