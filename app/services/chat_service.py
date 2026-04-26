@@ -410,12 +410,35 @@ class ChatService:
             agent = _resolve_agent(db, user.id, agent_ref or "") if agent_ref else None
 
         if agent is None:
+            # Show a picker instead of asking the user to remember a name.
+            agents = list(
+                db.execute(
+                    select(Agent)
+                    .where(Agent.user_id == user.id)
+                    .order_by(Agent.name.asc())
+                )
+                .scalars()
+                .all()
+            )
+            if not agents:
+                return ChatResponse(
+                    text=(
+                        "You don't have any agents yet. "
+                        "Try: <i>create an agent that summarizes my unread emails</i>."
+                    ),
+                    intent=INTENT_RUN_AGENT,
+                )
             return ChatResponse(
-                text=(
-                    "I couldn't find that agent. "
-                    "Try `/run <agent_name> <your prompt>` or say “list my agents”."
-                ),
+                text="Which agent should I run? Pick one:",
                 intent=INTENT_RUN_AGENT,
+                actions=[
+                    {
+                        "type": "agent_picker",
+                        "action": "run",
+                        "prompt": "Pick an agent to run",
+                        "agents": [{"id": a.id, "name": a.name} for a in agents],
+                    }
+                ],
             )
 
         try:

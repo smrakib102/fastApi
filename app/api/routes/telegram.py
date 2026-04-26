@@ -260,11 +260,13 @@ def _render_agent_picker(
     action: str = "delete",
 ) -> None:
     """Render a list of agents as an inline keyboard for the given action."""
-    if action != "delete":
-        # Only delete is wired today — fall back to plain text for unknown
-        # actions instead of crashing.
+    if action not in {"delete", "run"}:
+        # Fall back to plain text for unknown actions instead of crashing.
         _send_message(db, chat_id, prompt + "\n(unsupported picker action)")
         return
+
+    icon = "🗑" if action == "delete" else "▶️"
+    cb_prefix = "delpick" if action == "delete" else "runpick"
 
     rows: list[list[dict]] = []
     for a in agents[:25]:  # Telegram inline keyboards: keep it sane
@@ -272,8 +274,8 @@ def _render_agent_picker(
         name = a.get("name") or f"Agent {agent_id}"
         if agent_id is None:
             continue
-        rows.append([{"text": f"🗑 {name}", "callback_data": f"delpick:{agent_id}"}])
-    rows.append([{"text": "Cancel", "callback_data": "delcancel"}])
+        rows.append([{"text": f"{icon} {name}", "callback_data": f"{cb_prefix}:{agent_id}"}])
+    rows.append([{"text": "Cancel", "callback_data": "delcancel" if action == "delete" else "runcancel"}])
     _send_message(
         db,
         chat_id,
@@ -563,7 +565,7 @@ def telegram_webhook(
         parts = data.split(":", 2)
 
         # ---- Agent delete callbacks (from unified ChatService picker) ----
-        if data == "delcancel":
+        if data in {"delcancel", "runcancel"}:
             link = db.execute(
                 select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
             ).scalar_one_or_none()
@@ -577,8 +579,65 @@ def telegram_webhook(
                 _edit_message_text(
                     db, str(chat_id), int(message_id), "Cancelled.", reply_markup={"inline_keyboard": []}
                 )
+            if data == "runcancel":
+                # Drop any pending run-prompt state for this chat.
+                try:
+                    get_redis().delete(f"telegram:pending_run:{chat_id}")
+                except Exception:  # noqa: BLE001
+                    pass
             if callback_id:
                 _answer_callback(db, callback_id, "Cancelled")
+            return {"ok": True}
+
+        if parts[0] == "runpick" and len(parts) >= 2:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id = int(parts[1])
+            except ValueError:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+            agent = db.execute(
+                select(Agent).where(Agent.id == agent_id, Agent.user_id == user_id)
+            ).scalar_one_or_none()
+            if not agent:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Agent not found")
+                return {"ok": True}
+            # Stash the pending run so the user's next message becomes the
+            # prompt. 5-min TTL is plenty for a normal back-and-forth.
+            try:
+                get_redis().setex(
+                    f"telegram:pending_run:{chat_id}",
+                    settings.telegram_prompt_ttl_seconds,
+                    json.dumps({"agent_id": agent.id, "agent_name": agent.name}),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "telegram_pending_run_store_failed",
+                    extra={"chat_id": str(chat_id), "agent_id": agent.id},
+                )
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            confirmation = (
+                f"▶️ Selected <b>{agent.name}</b>.\n"
+                "Now send the prompt you want it to run."
+            )
+            if message_id is not None:
+                _edit_message_text(
+                    db, str(chat_id), int(message_id), confirmation, reply_markup={"inline_keyboard": []}
+                )
+            else:
+                _send_message(db, str(chat_id), confirmation)
+            if callback_id:
+                _answer_callback(db, callback_id, agent.name)
             return {"ok": True}
 
         if parts[0] in {"delpick", "delconfirm"} and len(parts) >= 2:
@@ -1201,6 +1260,50 @@ def telegram_webhook(
     if stripped_early in {"/help", "/commands"}:
         _send_message(db, str(chat_id), _HELP_TEXT)
         return {"ok": True}
+
+    # ----------------------------------------------------------------------
+    # Pending-run resolver: user previously picked an agent via the run
+    # picker — their next non-slash message becomes the run prompt.
+    # ----------------------------------------------------------------------
+    if text and not text.strip().startswith("/"):
+        try:
+            pending_run_raw = get_redis().get(f"telegram:pending_run:{chat_id}")
+        except Exception:  # noqa: BLE001
+            pending_run_raw = None
+        if pending_run_raw:
+            try:
+                pending_run = json.loads(pending_run_raw)
+                pending_agent_id = int(pending_run.get("agent_id"))
+            except Exception:  # noqa: BLE001
+                pending_agent_id = 0
+            if pending_agent_id:
+                agent = db.execute(
+                    select(Agent).where(
+                        Agent.id == pending_agent_id, Agent.user_id == linked_user_id
+                    )
+                ).scalar_one_or_none()
+                # Always clear the pending state — one-shot.
+                try:
+                    get_redis().delete(f"telegram:pending_run:{chat_id}")
+                except Exception:  # noqa: BLE001
+                    pass
+                if not agent:
+                    _send_message(db, str(chat_id), "That agent is no longer available.")
+                    return {"ok": True}
+                _send_chat_action(db, str(chat_id), "typing")
+                try:
+                    run = execute_agent_run(
+                        db, agent, linked_user_id, text.strip(), source="telegram:pickrun"
+                    )
+                except AgentRuntimeError as exc:
+                    _send_message(db, str(chat_id), f"⚠️ Couldn't run {agent.name}: {exc}")
+                    return {"ok": True}
+                _send_message(
+                    db,
+                    str(chat_id),
+                    f"✅ <b>{agent.name}</b> finished.\n\n{run.output_text or '(no output)'}",
+                )
+                return {"ok": True}
 
     # ------------------------------------------------------------------
     # Phase 2d: Unified ChatService fallback for free-text messages.
