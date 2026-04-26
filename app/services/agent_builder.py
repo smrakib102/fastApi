@@ -443,6 +443,15 @@ class AgentBuilder:
         else:
             spec = _spec_from_llm(data, text, available_names)
 
+        # Auto-attach the built-in group-summary tool when the agent
+        # obviously needs to read a Telegram group. The LLM tool list is
+        # filtered against ToolRegistry, but this plugin lives outside
+        # that registry — without this hook a summary agent would ship
+        # with `tools: []` and refuse to do anything when run.
+        if _agent_needs_telegram_group(spec, text):
+            if "telegram.group_summary" not in spec.tools:
+                spec.tools.append("telegram.group_summary")
+
         # ---- Resume incomplete prior creation? -----------------------------
         # If this user already has an agent with the same proposed name
         # and it's still incomplete (telegram-group agent without a bound

@@ -112,8 +112,91 @@ def _render_run_result(agent: Agent, run) -> str:
     output = (run.output_text or "").strip() if hasattr(run, "output_text") else ""
     if not output:
         output = "(no output)"
+    # If the run finished by direct-calling a tool, output_text is a
+    # JSON dump of the tool's return value. Pretty-print known shapes
+    # (e.g. group_summary's {"chat_id": ..., "summary": ...}) instead
+    # of dumping the raw JSON to the user.
+    pretty = output
+    if output.startswith("{"):
+        try:
+            import json as _json
+
+            blob = _json.loads(output)
+            if isinstance(blob, dict) and isinstance(blob.get("summary"), str):
+                pretty = blob["summary"].strip() or "(empty summary)"
+        except Exception:  # noqa: BLE001
+            pretty = output
     status = getattr(run, "status", "unknown")
-    return f"✅ {agent.name} finished ({status}).\n\n{output}"
+    return f"✅ {agent.name} finished ({status}).\n\n{pretty}"
+
+
+# Heuristics for "the user just said `run agent` / `run my X` / `start it`
+# with no real task body". We don't want to ship that to the LLM-planner
+# because it'll bail out with "no specific task was provided".
+import json as _json_for_helpers
+import re as _re_for_helpers
+
+_TRIVIAL_RUN_PROMPTS = _re_for_helpers.compile(
+    r"^\s*(?:/run\b\s*\S*\s*$"
+    r"|run(?:\s+(?:the|my|this))?\s*(?:agent|bot|workflow)?\s*$"
+    r"|(?:please\s+)?(?:start|trigger|kick\s*off|launch|execute)"
+    r"(?:\s+(?:the|my|this))?\s*(?:agent|bot|workflow|it)?\s*$"
+    r"|go\s*$|do\s+it\s*$)",
+    _re_for_helpers.IGNORECASE,
+)
+
+# Phrases that, when a Telegram-summary agent is the bound agent, mean
+# "produce a summary now". Kept generous because the alternative is the
+# LLM hallucinating "please attach a group" replies.
+_SUMMARY_REQUEST_HINTS = (
+    "summary",
+    "summarise",
+    "summarize",
+    "digest",
+    "recap",
+    "what happened",
+    "what did i miss",
+    "catch me up",
+    "tl;dr",
+)
+
+
+def _agent_has_group_summary(agent: Agent) -> tuple[bool, str | None]:
+    """Return (has_tool_and_bound, bound_chat_id)."""
+    try:
+        tools = _json_for_helpers.loads(agent.tools or "[]")
+    except Exception:  # noqa: BLE001
+        tools = []
+    if "telegram.group_summary" not in tools:
+        return False, None
+    try:
+        cfg = _json_for_helpers.loads(agent.config) if agent.config else {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    bound = cfg.get("telegram_chat_id") if isinstance(cfg, dict) else None
+    if not bound:
+        return False, None
+    return True, str(bound)
+
+
+def _maybe_default_summary_prompt(agent: Agent, prompt: str) -> str:
+    """If the user's prompt is a no-op trigger and the agent is a bound
+    Telegram-summary agent, replace it with a direct-tool-call JSON the
+    agent runtime understands. Otherwise return the prompt unchanged."""
+    has_tool, chat_id = _agent_has_group_summary(agent)
+    if not has_tool:
+        return prompt
+    p = (prompt or "").strip()
+    is_trivial = (not p) or bool(_TRIVIAL_RUN_PROMPTS.match(p))
+    is_summary_ask = any(hint in p.lower() for hint in _SUMMARY_REQUEST_HINTS)
+    if not (is_trivial or is_summary_ask):
+        return prompt
+    return _json_for_helpers.dumps(
+        {
+            "tool": "telegram.group_summary",
+            "arguments": {"chat_id": chat_id},
+        }
+    )
 
 
 # --- Operator persona ------------------------------------------------------
@@ -343,6 +426,30 @@ class ChatService:
             return response
 
         intent = self.router.detect(text)
+
+        # Context-aware override: if this conversation is bound to a
+        # Telegram-summary agent and the user is obviously asking for a
+        # summary ("give me a digest", "what happened", "summarise it"),
+        # the rule-based classifier won't fire INTENT_RUN_AGENT (it has
+        # no conversation context). Promote it manually so we don't
+        # bounce the user back to the LLM, which would hallucinate
+        # "please attach me to a group" replies.
+        if (
+            intent.name == INTENT_GENERAL_CHAT
+            and conversation.agent_id
+            and any(hint in text.lower() for hint in _SUMMARY_REQUEST_HINTS)
+        ):
+            bound_agent = db.get(Agent, conversation.agent_id)
+            if bound_agent is not None:
+                has_tool, _ = _agent_has_group_summary(bound_agent)
+                if has_tool:
+                    intent = Intent(
+                        name=INTENT_RUN_AGENT,
+                        confidence=0.9,
+                        slots={"prompt": text},
+                        matched_rule="ctx.bound_summary_agent",
+                    )
+
         logger.info(
             "chat_service_intent",
             extra={
@@ -408,7 +515,6 @@ class ChatService:
             agent = db.get(Agent, conversation.agent_id)
         else:
             agent = _resolve_agent(db, user.id, agent_ref or "") if agent_ref else None
-
         if agent is None:
             # Show a picker instead of asking the user to remember a name.
             agents = list(
@@ -441,6 +547,17 @@ class ChatService:
                 ],
             )
 
+        # Always bind the conversation to this agent so follow-up
+        # messages ("give me a summary") route here without a name.
+        memory_service.bind_agent(db, conversation, agent.id)
+
+        # If the user typed a trivial "run agent" / "run X" with no real
+        # task, and this is a Telegram-summary agent that's already bound
+        # to a group, fast-path it as a direct tool call. Without this
+        # the LLM-planner would receive "Run agent" as the task — which
+        # is what produced the "No specific task was provided" loop.
+        prompt = _maybe_default_summary_prompt(agent, prompt)
+
         try:
             run = execute_agent_run(
                 db, agent, user.id, prompt, source=f"chat:{conversation.channel}"
@@ -450,8 +567,6 @@ class ChatService:
                 text=f"⚠️ Couldn't run {agent.name}: {exc}",
                 intent=INTENT_RUN_AGENT,
             )
-
-        memory_service.bind_agent(db, conversation, agent.id)
 
         # If the agent looks Telegram-group-bound but has no chat yet,
         # show the picker so the user doesn't get a dead-end "type the
