@@ -17,13 +17,24 @@ def _get_bot_token(db: Session) -> str | None:
     return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
 
 
-def send_message(db: Session, chat_id: str, text: str) -> None:
+def send_message(db: Session, chat_id: str, text: str) -> dict | None:
+    """Send a Telegram message. Returns the parsed Bot API response dict
+    (so callers can detect ``ok: false`` cases like "bot was kicked")
+    or None if no token is configured / the request couldn't be sent.
+    """
     bot_token = _get_bot_token(db)
     if not bot_token:
-        return
+        return None
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    httpx.post(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        json=payload,
-        timeout=20,
-    )
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json=payload,
+            timeout=20,
+        )
+    except Exception:  # noqa: BLE001 — caller decides what to do on failure
+        return None
+    try:
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "description": resp.text[:200]}

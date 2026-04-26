@@ -255,6 +255,61 @@ def _ensure_unique_name(db: Session, base_name: str) -> str:
     return name
 
 
+# ---- Telegram-group convenience helpers ----------------------------------
+# Surfaced in the post-create confirmation when the agent looks like it
+# needs to read or post in a Telegram group, so the user gets a one-tap
+# "add me to the group" link instead of being told to dig through menus.
+
+_TELEGRAM_GROUP_HINTS = (
+    "telegram group",
+    "telegram channel",
+    "telegram chat",
+    "group conversation",
+    "group chat",
+    "monitor my group",
+    "watch my group",
+    "track my group",
+    "summari",  # "summarize", "summarise"
+)
+
+
+def _agent_needs_telegram_group(spec: AgentSpec, raw_text: str) -> bool:
+    """Heuristic: does this agent need to be added to a Telegram group?"""
+    blob = " ".join(
+        [
+            (raw_text or "").lower(),
+            (spec.role or "").lower(),
+            (spec.raw_description or "").lower(),
+        ]
+    )
+    has_telegram_tool = any(
+        "telegram" in (t or "").lower()
+        for t in (spec.tools or []) + (spec.requested_tools or [])
+    )
+    mentions_group = any(hint in blob for hint in _TELEGRAM_GROUP_HINTS)
+    return has_telegram_tool and mentions_group
+
+
+def _telegram_group_setup_block(db: Session) -> str | None:
+    """Render a one-tap invite link + short next-steps guide. None if the
+    bot username isn't configured (so we don't print a broken link)."""
+    # Local imports to avoid a top-level cycle: telegram.py imports the
+    # builder via chat_service in the unified flow.
+    from app.api.routes.telegram import _get_bot_username
+    from app.services.telegram_group_helpers import build_group_invite_link
+
+    bot_username = _get_bot_username(db)
+    invite = build_group_invite_link(bot_username)
+    if not invite:
+        return None
+    return (
+        "<b>One last step</b>\n"
+        f'<a href="{invite}">➕ Tap here to add me to your group as admin</a>\n'
+        "Telegram requires a human admin to add me — this link opens the "
+        "native Add-bot dialog with the right permissions pre-checked."
+    )
+
+
 # ---- public service --------------------------------------------------------
 class AgentBuilder:
     """Stateless service. Caller commits the transaction."""
@@ -298,6 +353,16 @@ class AgentBuilder:
                 f"\n\nNote: I wanted to use {', '.join(missing)} but they aren't "
                 "available yet. I'll request access in a follow-up step."
             )
+
+        # If the agent involves a Telegram group source, surface a one-tap
+        # invite link so the user doesn't have to hunt through group
+        # settings to add the bot. Telegram doesn't allow bots to invite
+        # themselves, so a single tap is the realistic minimum.
+        if _agent_needs_telegram_group(spec, text):
+            invite_block = _telegram_group_setup_block(db)
+            if invite_block:
+                confirmation += "\n\n" + invite_block
+
         confirmation += f"\n\nSay “run {spec.name}” to start it."
 
         return BuildResult(

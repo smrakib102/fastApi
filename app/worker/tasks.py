@@ -7,13 +7,20 @@ from sqlalchemy import select
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
+from app.models.agent import Agent
 from app.models.approval import Approval
+from app.models.telegram_link import TelegramLink
 from app.services.agent_executor import ToolExecutionError, execute_tool_local
 from app.services.agent_runtime import execute_agent_run_by_id
 from app.models.agent_run import AgentRun
 from app.models.worker_heartbeat import WorkerHeartbeat
 from app.models.summary_schedule import SummarySchedule
 from app.services.summary_service import generate_summary
+from app.services.telegram_group_helpers import (
+    branded_summary,
+    build_group_invite_link,
+    is_bot_not_in_chat_error,
+)
 from app.services.telegram_service import send_message
 from app.worker.celery_app import celery_app
 from app.core.config import settings
@@ -22,6 +29,59 @@ from app.core.config import settings
 @celery_app.task(name="app.worker.tasks.ping")
 def ping():
     return "pong"
+
+
+def _resolve_agent_name_for_chat(db, user_id: int, chat_id: str) -> str | None:
+    """Best-effort: find the user's agent whose config references this chat.
+
+    Returns the agent's name if found, else None. We do a string LIKE on
+    the JSON config column — fine at our scale; if user counts grow we'd
+    move to a proper FK on SummarySchedule.
+    """
+    try:
+        agent = db.execute(
+            select(Agent)
+            .where(
+                Agent.user_id == user_id,
+                Agent.config.like(f"%{chat_id}%"),
+            )
+            .order_by(Agent.created_at.desc())
+        ).scalars().first()
+    except Exception:  # noqa: BLE001 — never fail the task on lookup
+        return None
+    return agent.name if agent else None
+
+
+def _dm_user(db, user_id: int, text: str) -> None:
+    """DM the user via the platform Telegram bot. Best-effort, never raises."""
+    link = db.execute(
+        select(TelegramLink).where(TelegramLink.user_id == user_id)
+    ).scalar_one_or_none()
+    if not link or not link.telegram_user_id:
+        return
+    try:
+        send_message(db, str(link.telegram_user_id), text)
+    except Exception:  # noqa: BLE001
+        logger.exception("dm_user_failed", extra={"user_id": user_id})
+
+
+def _maybe_warn_bot_not_in_group(db, schedule, response: dict | None) -> None:
+    """If Telegram says we can't reach the group, DM the owner an invite link."""
+    if not is_bot_not_in_chat_error(response):
+        return
+    bot_username = settings.telegram_bot_username
+    invite = build_group_invite_link(bot_username)
+    msg_lines = [
+        "⚠️ I tried to send your scheduled summary but I can't read that group.",
+        "Please add me to the group as an admin so I can keep monitoring it.",
+    ]
+    if invite:
+        msg_lines.append(f'<a href="{invite}">➕ Tap here to add me to your group</a>')
+    else:
+        msg_lines.append(
+            "Open your group → Settings → Administrators → Add → search for this bot."
+        )
+    _dm_user(db, schedule.user_id, "\n".join(msg_lines))
 
 
 @celery_app.task(name="app.worker.tasks.send_summaries")
@@ -46,11 +106,22 @@ def send_summaries():
                     continue
 
             try:
-                summary = generate_summary(db, schedule.user_id, schedule.chat_id, schedule.timezone)
-                send_message(db, schedule.chat_id, summary)
+                body = generate_summary(
+                    db, schedule.user_id, schedule.chat_id, schedule.timezone
+                )
+                agent_name = _resolve_agent_name_for_chat(
+                    db, schedule.user_id, schedule.chat_id
+                )
+                message = branded_summary(agent_name, body, kind="Daily summary")
+                response = send_message(db, schedule.chat_id, message)
+                _maybe_warn_bot_not_in_group(db, schedule, response)
                 schedule.last_sent_at = now_utc
                 db.add(schedule)
             except Exception:
+                logger.exception(
+                    "send_summary_failed",
+                    extra={"schedule_id": schedule.id, "user_id": schedule.user_id},
+                )
                 continue
         db.commit()
     finally:
