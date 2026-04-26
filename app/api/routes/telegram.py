@@ -1252,12 +1252,22 @@ def telegram_webhook(
     # ----------------------------------------------------------------------
     # Linked user just sent /start or /help — show the welcome menu BEFORE
     # we route to the unified ChatService so it doesn't end up at the LLM.
+    # Also clear any stale pending-run state so the next message isn't
+    # accidentally consumed as a prompt for a previously-picked agent.
     # ----------------------------------------------------------------------
     stripped_early = (text or "").strip().lower()
     if stripped_early in {"/start", "/start@" + (_get_bot_username(db) or "").lower()}:
+        try:
+            get_redis().delete(f"telegram:pending_run:{chat_id}")
+        except Exception:  # noqa: BLE001
+            pass
         _send_welcome(db, str(chat_id))
         return {"ok": True}
     if stripped_early in {"/help", "/commands"}:
+        try:
+            get_redis().delete(f"telegram:pending_run:{chat_id}")
+        except Exception:  # noqa: BLE001
+            pass
         _send_message(db, str(chat_id), _HELP_TEXT)
         return {"ok": True}
 
