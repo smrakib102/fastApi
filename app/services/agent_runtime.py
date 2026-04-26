@@ -16,10 +16,11 @@ from app.services.agent_memory import build_memory_context, get_recent_steps
 from app.services.agent_planner import generate_plan, plan_recovery_action, summarize_run_context
 from app.services.agent_state import add_step, create_run, finalize_run
 from app.services.agent_tool_router import rank_tools
-from app.services.feature_flags import get_mode
+from app.services.feature_flags import get_bool, get_mode
 from app.services.intent_verifier import evaluate as evaluate_intent
 from app.services.tool_call_audit import now_ms, record_tool_call, should_audit
 from app.services.validation_kernel import evaluate as evaluate_validation
+from app.services.safety_kernel import evaluate as evaluate_safety
 from app.worker.celery_app import celery_app
 
 
@@ -68,7 +69,9 @@ def _execute_tool_with_audit(
 ) -> dict:
     validation_mode = get_mode("validation_kernel_mode")
     intent_mode = get_mode("intent_verifier_mode")
-    audit_enabled = should_audit(validation_mode, intent_mode)
+    safety_mode = get_mode("safety_kernel_mode")
+    risk_registry_enabled = get_bool("risk_registry_enabled")
+    audit_enabled = should_audit(validation_mode, intent_mode) or safety_mode != "off"
 
     kernel_decisions: dict = {}
     if validation_mode in {"shadow", "enforce"}:
@@ -85,6 +88,14 @@ def _execute_tool_with_audit(
         )
         kernel_decisions["intent"] = decision.status
         kernel_decisions["intent_reasons"] = decision.reasons
+
+    hitl_required = False
+    if safety_mode in {"shadow", "enforce"} and risk_registry_enabled:
+        decision = evaluate_safety(db, tool_name)
+        kernel_decisions["safety"] = decision.status
+        kernel_decisions["risk_tier"] = decision.risk_tier
+        kernel_decisions["safety_reasons"] = decision.reasons
+        hitl_required = decision.requires_hitl
 
     start = time.monotonic() if audit_enabled else None
     try:
@@ -107,6 +118,7 @@ def _execute_tool_with_audit(
                 error_message=None,
                 latency_ms=now_ms(start),
                 kernel_decisions=kernel_decisions,
+                hitl_required=hitl_required,
             )
         return result
     except ToolExecutionError as exc:
@@ -128,6 +140,7 @@ def _execute_tool_with_audit(
                 error_message=str(exc),
                 latency_ms=now_ms(start),
                 kernel_decisions=kernel_decisions,
+                hitl_required=hitl_required,
             )
         raise
 
