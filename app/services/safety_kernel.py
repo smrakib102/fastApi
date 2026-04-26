@@ -18,6 +18,7 @@ class SafetyDecision:
     status: str  # allow | hitl | deny
     risk_tier: str
     requires_hitl: bool
+    requires_dry_run: bool
     reasons: list[str]
 
 
@@ -31,6 +32,7 @@ def evaluate(db: Session, tool_name: str) -> SafetyDecision:
             status="hitl",
             risk_tier=profile.risk_tier,
             requires_hitl=True,
+            requires_dry_run=profile.requires_dry_run,
             reasons=reasons,
         )
 
@@ -39,5 +41,6 @@ def evaluate(db: Session, tool_name: str) -> SafetyDecision:
         status="allow",
         risk_tier=profile.risk_tier,
         requires_hitl=False,
+        requires_dry_run=profile.requires_dry_run,
         reasons=reasons,
     )

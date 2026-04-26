@@ -17,6 +17,8 @@ from app.services.agent_planner import generate_plan, plan_recovery_action, summ
 from app.services.agent_state import add_step, create_run, finalize_run
 from app.services.agent_tool_router import rank_tools
 from app.services.feature_flags import get_bool, get_mode
+from app.services.dry_run_log import record_shadow_dry_run
+from app.services.hitl_queue import record_shadow_confirmation
 from app.services.intent_verifier import evaluate as evaluate_intent
 from app.services.tool_call_audit import now_ms, record_tool_call, should_audit
 from app.services.validation_kernel import evaluate as evaluate_validation
@@ -71,6 +73,8 @@ def _execute_tool_with_audit(
     intent_mode = get_mode("intent_verifier_mode")
     safety_mode = get_mode("safety_kernel_mode")
     risk_registry_enabled = get_bool("risk_registry_enabled")
+    hitl_enabled = get_bool("hitl_enabled")
+    dry_run_enabled = get_bool("dry_run_enabled")
     audit_enabled = should_audit(validation_mode, intent_mode) or safety_mode != "off"
 
     kernel_decisions: dict = {}
@@ -90,16 +94,42 @@ def _execute_tool_with_audit(
         kernel_decisions["intent_reasons"] = decision.reasons
 
     hitl_required = False
+    dry_run_required = False
     if safety_mode in {"shadow", "enforce"} and risk_registry_enabled:
         decision = evaluate_safety(db, tool_name)
         kernel_decisions["safety"] = decision.status
         kernel_decisions["risk_tier"] = decision.risk_tier
         kernel_decisions["safety_reasons"] = decision.reasons
         hitl_required = decision.requires_hitl
+        dry_run_required = decision.requires_dry_run
+        kernel_decisions["requires_dry_run"] = dry_run_required
+
+    if hitl_enabled and hitl_required:
+        record_shadow_confirmation(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            step_index=step_index,
+            tool_name=tool_name,
+            args=tool_args,
+            reason="HITL required (shadow mode)",
+        )
 
     start = time.monotonic() if audit_enabled else None
     try:
         result = execute_tool(db, tool_name, tool_args, user_id, agent_id, retries=1)
+        if dry_run_enabled and dry_run_required:
+            record_shadow_dry_run(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                args=tool_args,
+                reason="Dry-run required (shadow mode)",
+            )
         if audit_enabled:
             record_tool_call(
                 db,
