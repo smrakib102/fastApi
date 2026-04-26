@@ -348,6 +348,21 @@ def _render_telegram_group_picker(
                 ]
             )
 
+    # Stash an "awaiting group" pointer keyed by the user's tg id (== DM
+    # chat_id) so `my_chat_member` can auto-bind the next group the user
+    # adds the bot to, without forcing a second tap in the DM.
+    try:
+        get_redis().setex(
+            f"telegram:awaiting_group:{chat_id}",
+            settings.telegram_prompt_ttl_seconds,
+            str(agent_id),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "telegram_awaiting_group_store_failed",
+            extra={"chat_id": chat_id, "agent_id": agent_id},
+        )
+
     if invite_url:
         rows.append(
             [
@@ -366,10 +381,64 @@ def _render_telegram_group_picker(
     if not groups and invite_url:
         body += (
             "\n\nI don't see any groups yet. Tap "
-            "<b>Add me to a new group</b> below — "
-            "after I'm added, send /start here and I'll show your groups."
+            "<b>➕ Add me to a new group</b> below — "
+            "I'll auto-bind it once you've added me."
         )
     _send_message(db, chat_id, body, reply_markup={"inline_keyboard": rows})
+
+
+def _bind_group_to_agent(
+    db: Session, *, user_id: int, agent: "Agent", group_chat_id: str
+) -> None:
+    """Persist agent.config.telegram_chat_id = group_chat_id and ensure a
+    daily SummarySchedule exists. Caller is responsible for db.commit()."""
+    from app.models.summary_schedule import SummarySchedule
+
+    try:
+        cfg = json.loads(agent.config) if agent.config else {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    cfg["telegram_chat_id"] = str(group_chat_id)
+    agent.config = json.dumps(cfg)
+    db.add(agent)
+
+    existing = db.execute(
+        select(SummarySchedule).where(
+            SummarySchedule.user_id == user_id,
+            SummarySchedule.chat_id == str(group_chat_id),
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        db.add(
+            SummarySchedule(
+                user_id=user_id,
+                chat_id=str(group_chat_id),
+                timezone="UTC",
+                send_hour=18,
+                send_minute=0,
+                active=True,
+            )
+        )
+    else:
+        existing.active = True
+        db.add(existing)
+
+
+def _agent_manage_keyboard(agent_id: int) -> dict:
+    """Inline keyboard shown alongside the bind-success confirmation so
+    the user can tweak schedule / pause / delete without remembering
+    text commands."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🕒 Change time", "callback_data": f"agtime:{agent_id}"},
+                {"text": "⏸ Pause", "callback_data": f"agpause:{agent_id}"},
+            ],
+            [
+                {"text": "🗑 Delete agent", "callback_data": f"delpick:{agent_id}"},
+            ],
+        ]
+    }
 
 
 # ---- Welcome / help text --------------------------------------------------
@@ -645,66 +714,125 @@ def telegram_webhook(
                     )
                 ).scalar_one_or_none()
                 if link and link.telegram_user_id:
-                    # Persist group membership immediately so the picker
-                    # can list it before any messages have flowed in. We
-                    # write a synthetic TelegramMessage row carrying the
-                    # chat title in raw_json — that's the same shape the
-                    # picker already reads from.
+                    dm_chat_id = str(link.telegram_user_id)
+                    user_id_int = link.user_id
+
+                    # 1. Persist group membership immediately (idempotent)
+                    #    so the picker / future flows can list it.
                     try:
-                        marker_payload = {
-                            "chat": {
-                                "id": group_chat_id,
-                                "type": chat_kind,
-                                "title": group_title,
-                            },
-                            "_marker": "bot_joined",
-                        }
-                        db.add(
-                            TelegramMessage(
-                                user_id=link.user_id,
-                                chat_id=str(group_chat_id),
-                                chat_type=chat_kind,
-                                message_id=f"join-{my_chat_member.get('date') or ''}",
-                                sender_id=str(adder_tg_id),
-                                sender_name=(adder.get("first_name") or "")[:200],
-                                text=None,
-                                sent_at=None,
-                                raw_json=json.dumps(marker_payload, ensure_ascii=True),
+                        existing_marker = db.execute(
+                            select(TelegramMessage)
+                            .where(
+                                TelegramMessage.user_id == user_id_int,
+                                TelegramMessage.chat_id == str(group_chat_id),
                             )
-                        )
-                        db.commit()
+                            .limit(1)
+                        ).scalar_one_or_none()
+                        if existing_marker is None:
+                            marker_payload = {
+                                "chat": {
+                                    "id": group_chat_id,
+                                    "type": chat_kind,
+                                    "title": group_title,
+                                },
+                                "_marker": "bot_joined",
+                            }
+                            db.add(
+                                TelegramMessage(
+                                    user_id=user_id_int,
+                                    chat_id=str(group_chat_id),
+                                    chat_type=chat_kind,
+                                    message_id=f"join-{my_chat_member.get('date') or ''}",
+                                    sender_id=str(adder_tg_id),
+                                    sender_name=(adder.get("first_name") or "")[:200],
+                                    text=None,
+                                    sent_at=None,
+                                    raw_json=json.dumps(
+                                        marker_payload, ensure_ascii=True
+                                    ),
+                                )
+                            )
+                            db.commit()
                     except Exception:  # noqa: BLE001
                         db.rollback()
                         logger.exception(
                             "telegram_join_marker_write_failed",
                             extra={
                                 "chat_id": str(group_chat_id),
-                                "user_id": link.user_id,
+                                "user_id": user_id_int,
                             },
                         )
 
-                    # DM the user so the flow doesn't feel broken.
-                    bot_uname = _get_bot_username(db) or ""
-                    keyboard = None
-                    if bot_uname:
-                        keyboard = {
-                            "inline_keyboard": [
-                                [
-                                    {
-                                        "text": f"▶️ Continue setup in DM",
-                                        "url": f"https://t.me/{bot_uname}",
-                                    }
-                                ]
-                            ]
-                        }
+                    # 2. Auto-bind: if the user was mid-flow waiting to
+                    #    pick a group for an agent, bind it now and DM
+                    #    one clean success message. No "open chat to
+                    #    continue" noise — they don't need to do anything.
+                    pending_agent_id: int | None = None
+                    try:
+                        raw = get_redis().get(
+                            f"telegram:awaiting_group:{dm_chat_id}"
+                        )
+                        if raw:
+                            pending_agent_id = int(raw)
+                    except Exception:  # noqa: BLE001
+                        pending_agent_id = None
+
+                    if pending_agent_id is not None:
+                        agent = db.execute(
+                            select(Agent).where(
+                                Agent.id == pending_agent_id,
+                                Agent.user_id == user_id_int,
+                            )
+                        ).scalar_one_or_none()
+                        if agent is not None:
+                            try:
+                                _bind_group_to_agent(
+                                    db,
+                                    user_id=user_id_int,
+                                    agent=agent,
+                                    group_chat_id=str(group_chat_id),
+                                )
+                                db.commit()
+                            except Exception:  # noqa: BLE001
+                                db.rollback()
+                                logger.exception(
+                                    "telegram_autobind_failed",
+                                    extra={
+                                        "user_id": user_id_int,
+                                        "agent_id": pending_agent_id,
+                                        "group_chat_id": str(group_chat_id),
+                                    },
+                                )
+                            else:
+                                try:
+                                    get_redis().delete(
+                                        f"telegram:awaiting_group:{dm_chat_id}"
+                                    )
+                                    get_redis().delete(
+                                        f"telegram:group_pick:{dm_chat_id}:{agent.id}"
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                _send_message(
+                                    db,
+                                    dm_chat_id,
+                                    f"✅ <b>{agent.name}</b> is now monitoring "
+                                    f"<b>{group_title}</b>.\n"
+                                    "Daily summary at <b>6 PM UTC</b> — "
+                                    "DM'd to you.",
+                                    reply_markup=_agent_manage_keyboard(agent.id),
+                                )
+                                return {"ok": True}
+
+                    # 3. No pending agent — send a tiny silent-friendly
+                    #    DM so the user knows we joined, but no buttons,
+                    #    no "open chat to continue" since they're already
+                    #    here.
                     _send_message(
                         db,
-                        str(link.telegram_user_id),
-                        f"✅ I'm in <b>{group_title}</b>!\n\n"
-                        "Open our chat and tap the group I just joined "
-                        "in the picker — or say "
-                        "<code>run &lt;agent name&gt;</code> to bind it.",
-                        reply_markup=keyboard,
+                        dm_chat_id,
+                        f"✅ Added to <b>{group_title}</b>. I'll quietly "
+                        "log messages there for future summaries.",
                     )
         except Exception:  # noqa: BLE001 — best-effort notice
             logger.exception(
@@ -804,6 +932,220 @@ def telegram_webhook(
             return {"ok": True}
 
         # ---- Resume / discard incomplete agent ---------------------------
+        if parts[0] in {"agpause", "agtime"} and len(parts) >= 2:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id_int = int(parts[1])
+            except ValueError:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+            agent = db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id_int, Agent.user_id == user_id
+                )
+            ).scalar_one_or_none()
+            if not agent:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Agent not found")
+                return {"ok": True}
+
+            from app.models.summary_schedule import SummarySchedule
+
+            try:
+                cfg = json.loads(agent.config) if agent.config else {}
+            except Exception:  # noqa: BLE001
+                cfg = {}
+            bound_chat = cfg.get("telegram_chat_id")
+
+            if parts[0] == "agpause":
+                if not bound_chat:
+                    if callback_id:
+                        _answer_callback(db, callback_id, "No schedule yet")
+                    return {"ok": True}
+                schedule = db.execute(
+                    select(SummarySchedule).where(
+                        SummarySchedule.user_id == user_id,
+                        SummarySchedule.chat_id == str(bound_chat),
+                    )
+                ).scalar_one_or_none()
+                if schedule is None:
+                    if callback_id:
+                        _answer_callback(db, callback_id, "No schedule")
+                    return {"ok": True}
+                schedule.active = not bool(schedule.active)
+                db.add(schedule)
+                try:
+                    db.commit()
+                except Exception:  # noqa: BLE001
+                    db.rollback()
+                    logger.exception(
+                        "telegram_pause_failed",
+                        extra={"user_id": user_id, "agent_id": agent_id_int},
+                    )
+                    if callback_id:
+                        _answer_callback(db, callback_id, "Save failed")
+                    return {"ok": True}
+                state = "paused" if not schedule.active else "resumed"
+                _send_message(
+                    db,
+                    str(chat_id),
+                    f"⏸ <b>{agent.name}</b> {state}." if state == "paused"
+                    else f"▶️ <b>{agent.name}</b> {state}.",
+                    reply_markup=_agent_manage_keyboard(agent.id),
+                )
+                if callback_id:
+                    _answer_callback(db, callback_id, state.title())
+                return {"ok": True}
+
+            # parts[0] == "agtime" — show preset hour buttons.
+            preset_hours = [6, 9, 12, 15, 18, 21]
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": f"{h:02d}:00 UTC",
+                            "callback_data": f"agtset:{agent_id_int}:{h}",
+                        }
+                        for h in preset_hours[:3]
+                    ],
+                    [
+                        {
+                            "text": f"{h:02d}:00 UTC",
+                            "callback_data": f"agtset:{agent_id_int}:{h}",
+                        }
+                        for h in preset_hours[3:]
+                    ],
+                    [{"text": "Cancel", "callback_data": f"agtcancel:{agent_id_int}"}],
+                ]
+            }
+            _send_message(
+                db,
+                str(chat_id),
+                f"🕒 Pick a new send time for <b>{agent.name}</b>:",
+                reply_markup=keyboard,
+            )
+            if callback_id:
+                _answer_callback(db, callback_id, "Pick a time")
+            return {"ok": True}
+
+        if parts[0] == "agtcancel" and len(parts) >= 2:
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            if message_id is not None:
+                _edit_message_text(
+                    db,
+                    str(chat_id),
+                    int(message_id),
+                    "Cancelled.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            if callback_id:
+                _answer_callback(db, callback_id, "Cancelled")
+            return {"ok": True}
+
+        if parts[0] == "agtset" and len(parts) >= 3:
+            link = db.execute(
+                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+            ).scalar_one_or_none()
+            user_id = link.user_id if link else None
+            if not user_id:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Please link your account first")
+                return {"ok": True}
+            try:
+                agent_id_int = int(parts[1])
+                hour_int = int(parts[2])
+            except (ValueError, IndexError):
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad selection")
+                return {"ok": True}
+            if not 0 <= hour_int <= 23:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Bad hour")
+                return {"ok": True}
+            agent = db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id_int, Agent.user_id == user_id
+                )
+            ).scalar_one_or_none()
+            if not agent:
+                if callback_id:
+                    _answer_callback(db, callback_id, "Agent not found")
+                return {"ok": True}
+            try:
+                cfg = json.loads(agent.config) if agent.config else {}
+            except Exception:  # noqa: BLE001
+                cfg = {}
+            bound_chat = cfg.get("telegram_chat_id")
+            if not bound_chat:
+                if callback_id:
+                    _answer_callback(db, callback_id, "No group bound")
+                return {"ok": True}
+
+            from app.models.summary_schedule import SummarySchedule
+
+            schedule = db.execute(
+                select(SummarySchedule).where(
+                    SummarySchedule.user_id == user_id,
+                    SummarySchedule.chat_id == str(bound_chat),
+                )
+            ).scalar_one_or_none()
+            if schedule is None:
+                schedule = SummarySchedule(
+                    user_id=user_id,
+                    chat_id=str(bound_chat),
+                    timezone="UTC",
+                    send_hour=hour_int,
+                    send_minute=0,
+                    active=True,
+                )
+            else:
+                schedule.send_hour = hour_int
+                schedule.send_minute = 0
+                schedule.active = True
+            db.add(schedule)
+            try:
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                logger.exception(
+                    "telegram_settime_failed",
+                    extra={"user_id": user_id, "agent_id": agent_id_int},
+                )
+                if callback_id:
+                    _answer_callback(db, callback_id, "Save failed")
+                return {"ok": True}
+            message_obj = callback.get("message") or {}
+            message_id = message_obj.get("message_id")
+            confirmation = (
+                f"✅ <b>{agent.name}</b> will now send at <b>{hour_int:02d}:00 UTC</b>."
+            )
+            if message_id is not None:
+                _edit_message_text(
+                    db,
+                    str(chat_id),
+                    int(message_id),
+                    confirmation,
+                    reply_markup=_agent_manage_keyboard(agent.id),
+                )
+            else:
+                _send_message(
+                    db,
+                    str(chat_id),
+                    confirmation,
+                    reply_markup=_agent_manage_keyboard(agent.id),
+                )
+            if callback_id:
+                _answer_callback(db, callback_id, "Updated")
+            return {"ok": True}
         if parts[0] in {"resume", "discard"} and len(parts) >= 2:
             link = db.execute(
                 select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
@@ -1001,37 +1343,10 @@ def telegram_webhook(
 
             # Bind chat_id into agent.config (JSON) and create/upsert a
             # daily SummarySchedule for it.
-            from app.models.summary_schedule import SummarySchedule
-
             try:
-                cfg = json.loads(agent.config) if agent.config else {}
-            except Exception:  # noqa: BLE001
-                cfg = {}
-            cfg["telegram_chat_id"] = picked_chat_id
-            agent.config = json.dumps(cfg)
-            db.add(agent)
-
-            existing = db.execute(
-                select(SummarySchedule).where(
-                    SummarySchedule.user_id == user_id,
-                    SummarySchedule.chat_id == str(picked_chat_id),
+                _bind_group_to_agent(
+                    db, user_id=user_id, agent=agent, group_chat_id=picked_chat_id
                 )
-            ).scalar_one_or_none()
-            if not existing:
-                schedule = SummarySchedule(
-                    user_id=user_id,
-                    chat_id=str(picked_chat_id),
-                    timezone="UTC",
-                    send_hour=18,
-                    send_minute=0,
-                    active=True,
-                )
-                db.add(schedule)
-            else:
-                existing.active = True
-                db.add(existing)
-
-            try:
                 db.commit()
             except Exception:  # noqa: BLE001
                 db.rollback()
@@ -1051,27 +1366,29 @@ def telegram_webhook(
                 get_redis().delete(
                     f"telegram:group_pick:{chat_id}:{agent_id_int}"
                 )
+                get_redis().delete(f"telegram:awaiting_group:{chat_id}")
             except Exception:  # noqa: BLE001
                 pass
 
             message_obj = callback.get("message") or {}
             message_id = message_obj.get("message_id")
             confirmation = (
-                f"✅ <b>{agent.name}</b> is now monitoring this group and will "
-                "DM you a daily summary at 6 PM (UTC).\n\n"
-                "Change the time anytime by saying "
-                "<code>change schedule to 9pm</code>."
+                f"✅ <b>{agent.name}</b> is now monitoring this group.\n"
+                "Daily summary at <b>6 PM UTC</b> — DM'd to you."
             )
+            keyboard = _agent_manage_keyboard(agent.id)
             if message_id is not None:
                 _edit_message_text(
                     db,
                     str(chat_id),
                     int(message_id),
                     confirmation,
-                    reply_markup={"inline_keyboard": []},
+                    reply_markup=keyboard,
                 )
             else:
-                _send_message(db, str(chat_id), confirmation)
+                _send_message(
+                    db, str(chat_id), confirmation, reply_markup=keyboard
+                )
             if callback_id:
                 _answer_callback(db, callback_id, "Bound")
             return {"ok": True}
@@ -1429,41 +1746,28 @@ def telegram_webhook(
     # ------------------------------------------------------------------
     # Group / supergroup scope guard.
     # The bot exists in groups *only* to read messages so it can summarise
-    # them later. It must NEVER hold a conversation, run agents, or
-    # confirm anything inside a group — that all happens in the user's DM
-    # with the bot. So:
-    #   * /start (and /start@<botname>) in a group → reply once with a
-    #     tappable DM deep link, and return.
-    #   * Any other message in a group → store it for the summary and
-    #     return without invoking ChatService.
+    # them later. It must NEVER send anything in a group — no chat, no
+    # /start reply, no run output. All UX happens in the user's DM.
+    # /start in a group is therefore silently ignored (we don't even log
+    # it as content); every other group message is logged for the daily
+    # summary, then we exit.
     # ------------------------------------------------------------------
     if chat_type in {"group", "supergroup"}:
         stripped_in_group = (text or "").strip().lower()
         bot_uname = (_get_bot_username(db) or "").lower()
-        is_start = stripped_in_group in {
-            "/start",
-            f"/start@{bot_uname}" if bot_uname else "/start@",
-        }
-        if is_start and bot_uname:
-            dm_link = f"https://t.me/{bot_uname}"
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "💬 Open private chat to configure", "url": dm_link}]
-                ]
-            }
-            _send_message(
-                db,
-                str(chat_id),
-                "👋 Thanks for adding me! I'll quietly read messages here so I "
-                "can summarise them for you later.\n\n"
-                "All setup happens in our private chat — tap the button below "
-                "to continue there.",
-                reply_markup=keyboard,
+        is_command_for_us = (
+            stripped_in_group.startswith("/")
+            and (
+                bot_uname == ""
+                or stripped_in_group.endswith(f"@{bot_uname}")
+                or "@" not in stripped_in_group
             )
+        )
+        if is_command_for_us:
+            # Silently ignore — we never reply in groups.
             return {"ok": True}
 
-        # Log every other group message for the daily summary, then exit
-        # before ChatService / agent runtime can see it.
+        # Log every other group message for the daily summary.
         try:
             db.add(
                 TelegramMessage(
