@@ -1372,6 +1372,67 @@ def telegram_webhook(
     if message.get("date"):
         sent_at = datetime.fromtimestamp(message.get("date"), tz=timezone.utc)
 
+    # ------------------------------------------------------------------
+    # Group / supergroup scope guard.
+    # The bot exists in groups *only* to read messages so it can summarise
+    # them later. It must NEVER hold a conversation, run agents, or
+    # confirm anything inside a group — that all happens in the user's DM
+    # with the bot. So:
+    #   * /start (and /start@<botname>) in a group → reply once with a
+    #     tappable DM deep link, and return.
+    #   * Any other message in a group → store it for the summary and
+    #     return without invoking ChatService.
+    # ------------------------------------------------------------------
+    if chat_type in {"group", "supergroup"}:
+        stripped_in_group = (text or "").strip().lower()
+        bot_uname = (_get_bot_username(db) or "").lower()
+        is_start = stripped_in_group in {
+            "/start",
+            f"/start@{bot_uname}" if bot_uname else "/start@",
+        }
+        if is_start and bot_uname:
+            dm_link = f"https://t.me/{bot_uname}"
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "💬 Open private chat to configure", "url": dm_link}]
+                ]
+            }
+            _send_message(
+                db,
+                str(chat_id),
+                "👋 Thanks for adding me! I'll quietly read messages here so I "
+                "can summarise them for you later.\n\n"
+                "All setup happens in our private chat — tap the button below "
+                "to continue there.",
+                reply_markup=keyboard,
+            )
+            return {"ok": True}
+
+        # Log every other group message for the daily summary, then exit
+        # before ChatService / agent runtime can see it.
+        try:
+            db.add(
+                TelegramMessage(
+                    user_id=linked_user_id,
+                    chat_id=str(chat_id),
+                    chat_type=chat_type,
+                    message_id=str(message.get("message_id") or ""),
+                    sender_id=str(sender.get("id")) if sender.get("id") else None,
+                    sender_name=_build_display_name(message),
+                    text=text,
+                    sent_at=sent_at,
+                    raw_json=json.dumps(message, ensure_ascii=True),
+                )
+            )
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception(
+                "telegram_group_message_log_failed",
+                extra={"chat_id": str(chat_id)},
+            )
+        return {"ok": True}
+
     # Patch P4: when the unified Telegram pipeline is enabled, ChatService
     # → MemoryService is the canonical store (chat_messages table). Skip
     # the legacy telegram_messages insert in that mode so we don't
