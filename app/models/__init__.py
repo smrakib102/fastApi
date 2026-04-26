@@ -20,6 +20,8 @@ from app.models.summary_schedule import SummarySchedule
 from app.models.team import Team
 from app.models.team_agent import TeamAgent
 from app.models.tool_credential import ToolCredential
+from app.models.tool_confirmation import ToolConfirmation
+from app.models.tool_dry_run_log import ToolDryRunLog
 from app.models.tool_performance import ToolPerformance
 from app.models.tool_registry import ToolRegistry
 from app.models.tool_request import ToolRequest
@@ -52,6 +54,8 @@ __all__ = [
 	"Team",
 	"TeamAgent",
 	"ToolCredential",
+	"ToolConfirmation",
+	"ToolDryRunLog",
 	"ToolPerformance",
 	"ToolRegistry",
 	"ToolRequest",

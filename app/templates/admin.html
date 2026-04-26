@@ -126,5 +126,34 @@
             <p class="muted">No users found.</p>
         {% endif %}
     </div>
+
+    <div class="info-panel">
+        <h2>HITL Queue</h2>
+        {% if confirmations and confirmations|length > 0 %}
+            <div class="agent-grid">
+                {% for item in confirmations %}
+                    <div class="agent-card">
+                        <div class="agent-title">{{ item.tool_name }} · ID {{ item.id }}</div>
+                        <div class="agent-meta">User: {{ item.user_id }} · Agent: {{ item.agent_id or "-" }}</div>
+                        <div class="agent-meta">Status: {{ item.status }}</div>
+                        <div class="agent-meta">Reason: {{ item.reason or "-" }}</div>
+                        <div class="agent-meta">Requested: {{ item.requested_at }}</div>
+                        {% if item.status == "pending" %}
+                        <form class="form-stack" method="post" action="/admin/hitl/{{ item.id }}/approve">
+                            <button class="btn" type="submit">Approve</button>
+                        </form>
+                        <form class="form-stack" method="post" action="/admin/hitl/{{ item.id }}/reject">
+                            <button class="btn btn-outline" type="submit">Reject</button>
+                        </form>
+                        {% else %}
+                        <div class="agent-meta">Resolved: {{ item.resolved_at or "-" }} by {{ item.resolved_by or "-" }}</div>
+                        {% endif %}
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="muted">No pending confirmations.</p>
+        {% endif %}
+    </div>
 </section>
 {% endblock %}

@@ -25,6 +25,7 @@ from app.models.user_limit import UserLimit
 from app.models.telegram_link import TelegramLink
 from app.models.telegram_message import TelegramMessage
 from app.models.tool_request import ToolRequest
+from app.models.tool_confirmation import ToolConfirmation
 from app.models.tool_credential import ToolCredential
 from app.models.user_limit import UserLimit
 from app.services.audit_log import record_audit
@@ -340,6 +341,11 @@ def admin_panel(
         if key in {"telegram_bot_token", "openai_api_key", "gemini_api_key"}
     }
     limits = db.execute(select(UserLimit)).scalars().all()
+    confirmations = db.execute(
+        select(ToolConfirmation)
+        .order_by(ToolConfirmation.requested_at.desc())
+        .limit(50)
+    ).scalars().all()
     users = db.execute(select(User)).scalars().all()
     return templates.TemplateResponse(
         "admin.html",
@@ -350,9 +356,66 @@ def admin_panel(
             "masked_settings": masked_settings,
             "limits": limits,
             "users": users,
+            "confirmations": confirmations,
             "secrets_env_only": app_settings.secrets_env_only,
         },
     )
+
+
+@router.post("/hitl/{confirmation_id}/approve")
+def approve_hitl(
+    confirmation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_user),
+):
+    confirmation = db.execute(
+        select(ToolConfirmation).where(ToolConfirmation.id == confirmation_id)
+    ).scalar_one_or_none()
+    if not confirmation:
+        raise HTTPException(status_code=404, detail="Confirmation not found")
+    if confirmation.status != "pending":
+        return {"status": confirmation.status}
+    confirmation.status = "approved"
+    confirmation.resolved_at = datetime.now(timezone.utc)
+    confirmation.resolved_by = current_user.email
+    db.add(confirmation)
+    db.commit()
+    record_audit(
+        db,
+        current_user.id,
+        "hitl_approved",
+        "tool_confirmation",
+        str(confirmation.id),
+    )
+    return {"status": confirmation.status}
+
+
+@router.post("/hitl/{confirmation_id}/reject")
+def reject_hitl(
+    confirmation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_user),
+):
+    confirmation = db.execute(
+        select(ToolConfirmation).where(ToolConfirmation.id == confirmation_id)
+    ).scalar_one_or_none()
+    if not confirmation:
+        raise HTTPException(status_code=404, detail="Confirmation not found")
+    if confirmation.status != "pending":
+        return {"status": confirmation.status}
+    confirmation.status = "rejected"
+    confirmation.resolved_at = datetime.now(timezone.utc)
+    confirmation.resolved_by = current_user.email
+    db.add(confirmation)
+    db.commit()
+    record_audit(
+        db,
+        current_user.id,
+        "hitl_rejected",
+        "tool_confirmation",
+        str(confirmation.id),
+    )
+    return {"status": confirmation.status}
 
 
 @router.post("/panel/settings")

@@ -18,7 +18,7 @@ from app.services.agent_state import add_step, create_run, finalize_run
 from app.services.agent_tool_router import rank_tools
 from app.services.feature_flags import get_bool, get_mode
 from app.services.dry_run_log import record_shadow_dry_run
-from app.services.hitl_queue import record_shadow_confirmation
+from app.services.hitl_queue import record_pending_confirmation, record_shadow_confirmation
 from app.services.intent_verifier import evaluate as evaluate_intent
 from app.services.tool_call_audit import now_ms, record_tool_call, should_audit
 from app.services.validation_kernel import evaluate as evaluate_validation
@@ -103,6 +103,41 @@ def _execute_tool_with_audit(
         hitl_required = decision.requires_hitl
         dry_run_required = decision.requires_dry_run
         kernel_decisions["requires_dry_run"] = dry_run_required
+
+    if safety_mode == "enforce" and hitl_enabled and hitl_required:
+        token = record_pending_confirmation(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            step_index=step_index,
+            tool_name=tool_name,
+            args=tool_args,
+            reason="HITL required",
+        )
+        if audit_enabled:
+            record_tool_call(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                tool_category=None,
+                source="agent",
+                mode="live",
+                args=tool_args,
+                result=None,
+                status="hitl_pending",
+                error_class="HITLRequired",
+                error_message="HITL required",
+                latency_ms=now_ms(start),
+                kernel_decisions=kernel_decisions,
+                hitl_required=True,
+                hitl_resolution=None,
+                meta_json={"confirmation_token": token},
+            )
+        raise ToolExecutionError("HITL required")
 
     if hitl_enabled and hitl_required:
         record_shadow_confirmation(
