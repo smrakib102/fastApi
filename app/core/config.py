@@ -109,6 +109,46 @@ class Settings(BaseSettings):
     # Celery task. The engine itself is import-safe at all times.
     workflow_engine_enabled: bool = False
 
+    # --- v4 production governance: foundation flags --------------------------
+    # All flags default to OFF / "off" so this rollout is a pure no-op in prod
+    # until each phase is deliberately turned on (DB-backed admin toggle, with
+    # .env override authority for the two emergency switches below).
+    #
+    # Build identity (used by /health):
+    build_sha: str | None = None
+    build_tag: str | None = None
+
+    # Two emergency switches. .env value ALWAYS wins over DB.
+    #   SAFE_MODE_ENABLED   = block side-effecting tools, allow read-only
+    #   STRICT_MODE_ENABLED = block ALL tool calls (read + write); chat-only
+    safe_mode_enabled: bool = False
+    strict_mode_enabled: bool = False
+
+    # Tri-state kernels: "off" | "shadow" (log-only, do not block) | "enforce"
+    validation_kernel_mode: str = "off"
+    intent_verifier_mode: str = "off"
+    safety_kernel_mode: str = "off"
+    output_defence_mode: str = "off"
+    loop_detector_mode: str = "off"
+
+    # Feature gates (additive; each subsystem stays inert until turned on)
+    universal_api_enabled: bool = False
+    mcp_enabled: bool = False
+    dynamic_tools_enabled: bool = False
+    dynamic_tools_allow_fallback: bool = False
+    permission_v2_enabled: bool = False
+    planner_guardrails_enabled: bool = False
+    openclaw_persona_enabled: bool = False
+    hitl_enabled: bool = False
+    dry_run_enabled: bool = False
+    risk_registry_enabled: bool = False
+    action_summariser_enabled: bool = False
+
+    # Hardened HTTP client gate. While False, no new code paths are forced
+    # through the central client. Flip ON once services/http_client.py lands
+    # and its SSRF/DNS-rebinding tests pass.
+    allow_http_tools: bool = False
+
     class Config:
         env_file = ".env"
         extra = "ignore"

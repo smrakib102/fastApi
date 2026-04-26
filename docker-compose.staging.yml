@@ -1,0 +1,81 @@
+# Staging stack — runs alongside prod on the same VPS.
+# All services are namespaced and use distinct ports / volumes / DB / Redis index
+# so they cannot collide with the production stack defined in docker-compose.prod.yml.
+#
+# Usage on the VPS:
+#   cp .env.staging.example .env.staging   # then edit
+#   docker compose -p openclaw-staging -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#
+# Project name (-p openclaw-staging) keeps containers/volumes isolated from prod.
+
+services:
+  app:
+    build: .
+    container_name: openclaw-staging-app
+    working_dir: /app
+    env_file:
+      - .env.staging
+    environment:
+      PYTHONPATH: /app
+      ENVIRONMENT: staging
+    ports:
+      # host 8001 -> container 8000 (prod uses 8000)
+      - "8001:8000"
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: openclaw-staging-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+    # No host port published; staging app reaches it over the compose network.
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: openclaw-staging-redis
+    volumes:
+      - redisdata_staging:/data
+    # No host port published.
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: openclaw-staging-worker
+    working_dir: /app
+    command: celery -A app.worker.celery_app worker -Q planner,tool_calls,long_jobs,approvals,default --concurrency=2 --loglevel=info
+    env_file:
+      - .env.staging
+    environment:
+      PYTHONPATH: /app
+      ENVIRONMENT: staging
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  beat:
+    build: .
+    container_name: openclaw-staging-beat
+    working_dir: /app
+    command: celery -A app.worker.celery_app beat --loglevel=info
+    env_file:
+      - .env.staging
+    environment:
+      PYTHONPATH: /app
+      ENVIRONMENT: staging
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+volumes:
+  pgdata_staging:
+  redisdata_staging:
