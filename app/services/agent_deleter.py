@@ -45,12 +45,11 @@ def delete_agent_cascade(db: Session, *, user_id: int, agent_id: int) -> Optiona
     name = agent.name
 
     # Children that hold a hard FK to agents.id must go first.
-    run_ids = [
-        r.id
-        for r in db.execute(select(AgentRun.id).where(AgentRun.agent_id == agent.id))
+    run_ids = list(
+        db.execute(select(AgentRun.id).where(AgentRun.agent_id == agent.id))
         .scalars()
         .all()
-    ]
+    )
     if run_ids:
         db.query(AgentRunStep).filter(AgentRunStep.run_id.in_(run_ids)).delete(
             synchronize_session=False
