@@ -645,12 +645,66 @@ def telegram_webhook(
                     )
                 ).scalar_one_or_none()
                 if link and link.telegram_user_id:
+                    # Persist group membership immediately so the picker
+                    # can list it before any messages have flowed in. We
+                    # write a synthetic TelegramMessage row carrying the
+                    # chat title in raw_json — that's the same shape the
+                    # picker already reads from.
+                    try:
+                        marker_payload = {
+                            "chat": {
+                                "id": group_chat_id,
+                                "type": chat_kind,
+                                "title": group_title,
+                            },
+                            "_marker": "bot_joined",
+                        }
+                        db.add(
+                            TelegramMessage(
+                                user_id=link.user_id,
+                                chat_id=str(group_chat_id),
+                                chat_type=chat_kind,
+                                message_id=f"join-{my_chat_member.get('date') or ''}",
+                                sender_id=str(adder_tg_id),
+                                sender_name=(adder.get("first_name") or "")[:200],
+                                text=None,
+                                sent_at=None,
+                                raw_json=json.dumps(marker_payload, ensure_ascii=True),
+                            )
+                        )
+                        db.commit()
+                    except Exception:  # noqa: BLE001
+                        db.rollback()
+                        logger.exception(
+                            "telegram_join_marker_write_failed",
+                            extra={
+                                "chat_id": str(group_chat_id),
+                                "user_id": link.user_id,
+                            },
+                        )
+
+                    # DM the user so the flow doesn't feel broken.
+                    bot_uname = _get_bot_username(db) or ""
+                    keyboard = None
+                    if bot_uname:
+                        keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": f"▶️ Continue setup in DM",
+                                        "url": f"https://t.me/{bot_uname}",
+                                    }
+                                ]
+                            ]
+                        }
                     _send_message(
                         db,
                         str(link.telegram_user_id),
                         f"✅ I'm in <b>{group_title}</b>!\n\n"
-                        "Open our chat and say <code>run &lt;agent name&gt;</code> "
-                        "to bind this group to your agent.",
+                        "Open our chat and tap the group I just joined "
+                        "in the picker — or say "
+                        "<code>run &lt;agent name&gt;</code> to bind it.",
+                        reply_markup=keyboard,
                     )
         except Exception:  # noqa: BLE001 — best-effort notice
             logger.exception(
