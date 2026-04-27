@@ -409,14 +409,31 @@ def agent_builder(
 def tools_page(
     request: Request,
     current_user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     if not current_user:
         return RedirectResponse("/auth/login", status_code=303)
+
+    from app.core.config import settings as _settings  # local import to avoid cycles
+    from app.models.google_account import GoogleAccount
+
+    google_ready = bool(
+        _settings.google_oauth_client_id
+        and _settings.google_oauth_client_secret
+        and _settings.google_oauth_redirect_uri
+    )
+    google_account = db.execute(
+        select(GoogleAccount).where(GoogleAccount.user_id == current_user.id)
+    ).scalar_one_or_none()
+
     return templates.TemplateResponse(
         "tools.html",
         {
             "request": request,
             "user": current_user,
+            "google_oauth_ready": google_ready,
+            "google_connected": bool(google_account),
+            "google_account_email": google_account.account_email if google_account else None,
         },
     )
 

@@ -25,9 +25,12 @@ def _redact_value(value: Any) -> Any:
     return value
 
 
-def _redact_args(args: dict) -> dict:
+def _redact_args(args: Any) -> dict:
+    if not isinstance(args, dict):
+        return {"_raw": _redact_value(args)}
+
     redacted = {}
-    for key, value in (args or {}).items():
+    for key, value in args.items():
         key_str = str(key).lower()
         if any(token in key_str for token in ("token", "secret", "password", "key")):
             redacted[key] = "[redacted]"
@@ -47,7 +50,7 @@ def record_tool_call(
     tool_category: str | None,
     source: str,
     mode: str,
-    args: dict,
+    args: Any,
     result: dict | None,
     status: str,
     error_class: str | None,

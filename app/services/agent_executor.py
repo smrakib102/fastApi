@@ -255,6 +255,17 @@ def _validate_tool_schema(db: Session, name: str, args: dict) -> None:
 
 
 def _get_tool_schema(db: Session, name: str) -> dict | None:
+    if settings.plugin_loader_enabled:
+        try:
+            from app.plugins import plugin_registry
+
+            plugin_registry.discover()
+            plugin = plugin_registry.get(name)
+            if plugin is not None:
+                return plugin.args_schema or {"type": "object", "properties": {}, "required": []}
+        except Exception:
+            logger.debug("plugin_schema_lookup_failed", extra={"tool": name})
+
     manifest = tool_routes.tool_manifest(settings.tool_api_token)
     for tool in manifest.get("tools", []):
         if tool.get("name") == name:

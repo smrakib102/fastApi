@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.plugins.base import Plugin, PluginExecutionError, ToolContext
+from app.services.feature_flags import get_bool
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,11 @@ _BLOCKED_HOST_SUBSTRINGS = (
 
 
 def _http_fetch(args: dict, ctx: ToolContext) -> dict:
+    if not get_bool("allow_http_tools"):
+        raise PluginExecutionError(
+            '{"status":"blocked","blocked_reason":"policy_disabled"}',
+            status_code=403,
+        )
     url = args.get("url")
     if not isinstance(url, str) or not url:
         raise PluginExecutionError("Missing 'url'")

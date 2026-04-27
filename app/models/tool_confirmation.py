@@ -15,6 +15,7 @@ class ToolConfirmation(Base):
     step_index = Column(Integer, nullable=True)
     tool_name = Column(String(200), nullable=False)
     args_redacted = Column(Text, nullable=True)
+    meta_json = Column(Text, nullable=True)
     status = Column(String(24), nullable=False, default="pending")
     reason = Column(String(500), nullable=True)
     requested_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

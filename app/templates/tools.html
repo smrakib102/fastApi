@@ -17,7 +17,18 @@
         <div class="panel-card">
             <div class="panel-title">Google Workspace</div>
             <div class="muted">Gmail and Calendar actions are available once OAuth is enabled.</div>
-            <button class="btn btn-outline" disabled>OAuth setup needed</button>
+            {% if google_oauth_ready %}
+                {% if google_connected %}
+                    <button class="btn btn-outline" disabled>Connected</button>
+                    <div class="chat-status">Connected as {{ google_account_email }}.</div>
+                {% else %}
+                    <button class="btn btn-outline" id="connect-google">Connect Google</button>
+                    <div class="chat-status" id="google-status">Not connected yet.</div>
+                {% endif %}
+            {% else %}
+                <button class="btn btn-outline" disabled>OAuth setup needed</button>
+                <div class="chat-status">Missing OAuth configuration.</div>
+            {% endif %}
         </div>
         <div class="panel-card">
             <div class="panel-title">Custom tools</div>
@@ -30,6 +41,8 @@
 <script>
     const connectBtn = document.getElementById("connect-telegram");
     const statusEl = document.getElementById("telegram-status");
+    const googleBtn = document.getElementById("connect-google");
+    const googleStatus = document.getElementById("google-status");
 
     function renderTelegramStatus(payload) {
         if (!payload) {
@@ -83,6 +96,27 @@
             statusEl.textContent = "Bot username not configured.";
         }
     });
+
+    if (googleBtn) {
+        googleBtn.addEventListener("click", async () => {
+            if (googleStatus) {
+                googleStatus.textContent = "Opening Google OAuth...";
+            }
+            const response = await fetch("/google/oauth/start");
+            if (!response.ok) {
+                if (googleStatus) {
+                    googleStatus.textContent = "Unable to start OAuth.";
+                }
+                return;
+            }
+            const payload = await response.json();
+            if (payload.url) {
+                window.location.href = payload.url;
+            } else if (googleStatus) {
+                googleStatus.textContent = "OAuth URL missing.";
+            }
+        });
+    }
 
     loadTelegramStatus();
 </script>

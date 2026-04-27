@@ -75,3 +75,52 @@ def record_shadow_dry_run(
             "dry_run_shadow_record_failed",
             extra={"tool": tool_name, "error": str(exc)[:200]},
         )
+
+
+def record_dry_run(
+    db: Session,
+    *,
+    user_id: int | None,
+    agent_id: int | None,
+    run_id: int | None,
+    step_index: int | None,
+    tool_name: str,
+    args: dict,
+    simulated_result: dict | None,
+    reason: str | None = None,
+) -> None:
+    try:
+        args_payload = json.dumps(_redact_args(args), ensure_ascii=True)
+        simulated_payload = json.dumps(simulated_result or {}, ensure_ascii=True)
+        db.execute(
+            text(
+                """
+                INSERT INTO tool_dry_run_log (
+                    user_id, agent_id, run_id, step_index,
+                    tool_name, args_redacted, simulated_result,
+                    status, reason
+                ) VALUES (
+                    :user_id, :agent_id, :run_id, :step_index,
+                    :tool_name, :args_redacted, :simulated_result,
+                    :status, :reason
+                )
+                """
+            ),
+            {
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "step_index": step_index,
+                "tool_name": tool_name,
+                "args_redacted": args_payload,
+                "simulated_result": simulated_payload,
+                "status": "dry_run",
+                "reason": reason,
+            },
+        )
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "dry_run_record_failed",
+            extra={"tool": tool_name, "error": str(exc)[:200]},
+        )

@@ -175,7 +175,14 @@ def run_agent(
     except AgentRuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return {"run_id": run.id, "status": run.status, "output": run.output_text}
+    output = run.output_text
+    if run.status == "blocked" and output:
+        try:
+            output = json.loads(output)
+        except json.JSONDecodeError:
+            output = run.output_text
+
+    return {"run_id": run.id, "status": run.status, "output": output}
 
 
 @router.get("/{agent_id}/runs")

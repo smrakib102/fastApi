@@ -37,19 +37,21 @@ def record_shadow_confirmation(
     tool_name: str,
     args: dict,
     reason: str | None,
+    meta_json: dict | None = None,
 ) -> None:
     try:
         token = secrets.token_hex(16)
         args_payload = json.dumps(_redact_args(args), ensure_ascii=True)
+        meta_payload = json.dumps(meta_json or {}, ensure_ascii=True) if meta_json else None
         db.execute(
             text(
                 """
                 INSERT INTO tool_confirmations (
                     token, user_id, agent_id, run_id, step_index,
-                    tool_name, args_redacted, status, reason
+                    tool_name, args_redacted, meta_json, status, reason
                 ) VALUES (
                     :token, :user_id, :agent_id, :run_id, :step_index,
-                    :tool_name, :args_redacted, :status, :reason
+                    :tool_name, :args_redacted, :meta_json, :status, :reason
                 )
                 """
             ),
@@ -61,6 +63,7 @@ def record_shadow_confirmation(
                 "step_index": step_index,
                 "tool_name": tool_name,
                 "args_redacted": args_payload,
+                "meta_json": meta_payload,
                 "status": "shadow",
                 "reason": reason,
             },
@@ -83,19 +86,21 @@ def record_pending_confirmation(
     tool_name: str,
     args: dict,
     reason: str | None,
+    meta_json: dict | None = None,
 ) -> str | None:
     try:
         token = secrets.token_hex(16)
         args_payload = json.dumps(_redact_args(args), ensure_ascii=True)
+        meta_payload = json.dumps(meta_json or {}, ensure_ascii=True) if meta_json else None
         db.execute(
             text(
                 """
                 INSERT INTO tool_confirmations (
                     token, user_id, agent_id, run_id, step_index,
-                    tool_name, args_redacted, status, reason
+                    tool_name, args_redacted, meta_json, status, reason
                 ) VALUES (
                     :token, :user_id, :agent_id, :run_id, :step_index,
-                    :tool_name, :args_redacted, :status, :reason
+                    :tool_name, :args_redacted, :meta_json, :status, :reason
                 )
                 """
             ),
@@ -107,6 +112,7 @@ def record_pending_confirmation(
                 "step_index": step_index,
                 "tool_name": tool_name,
                 "args_redacted": args_payload,
+                "meta_json": meta_payload,
                 "status": "pending",
                 "reason": reason,
             },

@@ -23,10 +23,10 @@ class RiskProfile:
 
 _DEFAULT_PROFILE = RiskProfile(
     tool_name="*",
-    risk_tier="medium",
-    requires_hitl=False,
-    requires_dry_run=False,
-    description=None,
+    risk_tier="high",
+    requires_hitl=True,
+    requires_dry_run=True,
+    description="Default high-risk policy for unknown tools",
 )
 
 
@@ -53,4 +53,5 @@ def get_profile(db: Session, tool_name: str) -> RiskProfile:
     except Exception as exc:  # noqa: BLE001
         logger.warning("risk_registry_read_failed", extra={"tool": tool_name, "error": str(exc)[:200]})
 
+    logger.warning("risk_registry_default_applied", extra={"tool": tool_name})
     return _DEFAULT_PROFILE

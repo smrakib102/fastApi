@@ -29,6 +29,7 @@ from app.models.tool_confirmation import ToolConfirmation
 from app.models.tool_credential import ToolCredential
 from app.models.user_limit import UserLimit
 from app.services.audit_log import record_audit
+from app.services.agent_executor import ToolExecutionError
 from app.services.email_service import send_email
 
 router = APIRouter()
@@ -368,26 +369,24 @@ def approve_hitl(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_user),
 ):
-    confirmation = db.execute(
-        select(ToolConfirmation).where(ToolConfirmation.id == confirmation_id)
-    ).scalar_one_or_none()
-    if not confirmation:
-        raise HTTPException(status_code=404, detail="Confirmation not found")
-    if confirmation.status != "pending":
-        return {"status": confirmation.status}
-    confirmation.status = "approved"
-    confirmation.resolved_at = datetime.now(timezone.utc)
-    confirmation.resolved_by = current_user.email
-    db.add(confirmation)
-    db.commit()
+    try:
+        from app.services.agent_runtime import resume_hitl_confirmation
+
+        result = resume_hitl_confirmation(
+            db,
+            confirmation_id=confirmation_id,
+            resolved_by=current_user.email,
+        )
+    except ToolExecutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     record_audit(
         db,
         current_user.id,
         "hitl_approved",
         "tool_confirmation",
-        str(confirmation.id),
+        str(confirmation_id),
     )
-    return {"status": confirmation.status}
+    return {"status": "approved", "result": result}
 
 
 @router.post("/hitl/{confirmation_id}/reject")

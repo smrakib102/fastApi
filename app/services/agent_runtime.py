@@ -7,9 +7,11 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.redis_client import get_redis
 from app.core.llm_client import LLMError
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
+from app.models.tool_confirmation import ToolConfirmation
 from app.services.agent_executor import ToolExecutionError, execute_tool
 from app.services.agent_analytics import get_planner_guidance
 from app.services.agent_memory import build_memory_context, get_recent_steps
@@ -17,17 +19,59 @@ from app.services.agent_planner import generate_plan, plan_recovery_action, summ
 from app.services.agent_state import add_step, create_run, finalize_run
 from app.services.agent_tool_router import rank_tools
 from app.services.feature_flags import get_bool, get_mode
-from app.services.dry_run_log import record_shadow_dry_run
+from app.services.dry_run_executor import execute_dry_run
+from app.services.dry_run_log import record_dry_run, record_shadow_dry_run
 from app.services.hitl_queue import record_pending_confirmation, record_shadow_confirmation
 from app.services.intent_verifier import evaluate as evaluate_intent
 from app.services.tool_call_audit import now_ms, record_tool_call, should_audit
 from app.services.validation_kernel import evaluate as evaluate_validation
 from app.services.safety_kernel import evaluate as evaluate_safety
+from app.services.output_defence import defend_output
 from app.worker.celery_app import celery_app
 
 
 class AgentRuntimeError(RuntimeError):
     pass
+
+
+class PolicyBlockError(ToolExecutionError):
+    def __init__(self, code: str, message: str, *, details: dict | None = None) -> None:
+        self.payload = {
+            "status": "blocked",
+            "code": code,
+            "blocked_reason": code,
+            "message": message,
+        }
+        if details:
+            self.payload["details"] = details
+        super().__init__(message)
+
+
+def _parse_error_payload(exc: Exception) -> dict | None:
+    if isinstance(exc, PolicyBlockError):
+        return exc.payload
+    try:
+        raw = str(exc)
+        if raw.startswith("{") and raw.endswith("}"):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_final_output(final_answer: object, last_tool_output: dict | None) -> object:
+    if not isinstance(final_answer, str):
+        return final_answer
+    normalized = final_answer.strip()
+    if normalized in {"{{last.output}}", "{{ last.output }}"}:
+        return last_tool_output or final_answer
+    if "{{last.output}}" in normalized or "{{ last.output }}" in normalized:
+        if last_tool_output is None:
+            return final_answer
+        return json.dumps(last_tool_output, ensure_ascii=True)
+    return final_answer
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +112,8 @@ def _execute_tool_with_audit(
     user_text: str | None,
     step_thought: str | None,
     direct_call: bool,
+    allow_hitl_bypass: bool = False,
+    hitl_resolution_override: str | None = None,
 ) -> dict:
     validation_mode = get_mode("validation_kernel_mode")
     intent_mode = get_mode("intent_verifier_mode")
@@ -76,12 +122,41 @@ def _execute_tool_with_audit(
     hitl_enabled = get_bool("hitl_enabled")
     dry_run_enabled = get_bool("dry_run_enabled")
     audit_enabled = should_audit(validation_mode, intent_mode) or safety_mode != "off"
+    start = time.monotonic() if audit_enabled else None
 
     kernel_decisions: dict = {}
     if validation_mode in {"shadow", "enforce"}:
         decision = evaluate_validation(tool_name, tool_args)
         kernel_decisions["validation"] = decision.status
         kernel_decisions["validation_reasons"] = decision.reasons
+        if validation_mode == "enforce" and decision.status != "pass":
+            if audit_enabled:
+                record_tool_call(
+                    db,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    tool_category=None,
+                    source="agent",
+                    mode="live",
+                    args=tool_args,
+                    result=None,
+                    status="blocked",
+                    error_class="SchemaInvalid",
+                    error_message="Validation kernel blocked execution",
+                    latency_ms=now_ms(start),
+                    kernel_decisions=kernel_decisions,
+                    hitl_required=False,
+                    hitl_resolution=hitl_resolution_override,
+                    meta_json={"blocked_reason": "schema_invalid"},
+                )
+            raise PolicyBlockError(
+                "schema_invalid",
+                "Validation kernel blocked execution",
+                details={"reasons": decision.reasons},
+            )
 
     if intent_mode in {"shadow", "enforce"}:
         decision = evaluate_intent(
@@ -92,6 +167,64 @@ def _execute_tool_with_audit(
         )
         kernel_decisions["intent"] = decision.status
         kernel_decisions["intent_reasons"] = decision.reasons
+        if intent_mode == "enforce" and decision.status != "verified":
+            if audit_enabled:
+                record_tool_call(
+                    db,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    tool_category=None,
+                    source="agent",
+                    mode="live",
+                    args=tool_args,
+                    result=None,
+                    status="blocked",
+                    error_class="IntentMismatch",
+                    error_message="Intent verifier blocked execution",
+                    latency_ms=now_ms(start),
+                    kernel_decisions=kernel_decisions,
+                    hitl_required=False,
+                    hitl_resolution=hitl_resolution_override,
+                    meta_json={"blocked_reason": "intent_mismatch"},
+                )
+            raise PolicyBlockError(
+                "intent_mismatch",
+                "Intent verifier blocked execution",
+                details={"reasons": decision.reasons},
+            )
+
+    if tool_name == "core.http_fetch" and not get_bool("allow_http_tools"):
+        kernel_decisions["policy"] = "blocked"
+        kernel_decisions["policy_reasons"] = ["HTTP tools disabled"]
+        if audit_enabled:
+            record_tool_call(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                tool_category=None,
+                source="agent",
+                mode="live",
+                args=tool_args,
+                result=None,
+                status="blocked",
+                error_class="PolicyDisabled",
+                error_message="HTTP tools disabled by policy",
+                latency_ms=now_ms(start),
+                kernel_decisions=kernel_decisions,
+                hitl_required=False,
+                hitl_resolution=hitl_resolution_override,
+                meta_json={"blocked_reason": "policy_disabled"},
+            )
+        raise PolicyBlockError(
+            "policy_disabled",
+            "HTTP tools disabled by policy",
+        )
 
     hitl_required = False
     dry_run_required = False
@@ -103,8 +236,47 @@ def _execute_tool_with_audit(
         hitl_required = decision.requires_hitl
         dry_run_required = decision.requires_dry_run
         kernel_decisions["requires_dry_run"] = dry_run_required
+        if decision.status == "deny":
+            if audit_enabled:
+                record_tool_call(
+                    db,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    tool_category=None,
+                    source="agent",
+                    mode="live",
+                    args=tool_args,
+                    result=None,
+                    status="blocked",
+                    error_class="SafetyDenied",
+                    error_message="Safety kernel denied execution",
+                    latency_ms=now_ms(start),
+                    kernel_decisions=kernel_decisions,
+                    hitl_required=hitl_required,
+                    hitl_resolution=hitl_resolution_override,
+                    meta_json={"blocked_reason": "safety_denied"},
+                )
+            raise PolicyBlockError(
+                "safety_denied",
+                "Safety kernel denied execution",
+                details={"reasons": decision.reasons},
+            )
 
-    if safety_mode == "enforce" and hitl_enabled and hitl_required:
+    if (not allow_hitl_bypass) and safety_mode == "enforce" and hitl_required:
+        payload = {
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "step_index": step_index,
+            "user_text": user_text,
+            "step_thought": step_thought,
+            "direct_call": direct_call,
+        }
         token = record_pending_confirmation(
             db,
             user_id=user_id,
@@ -114,6 +286,7 @@ def _execute_tool_with_audit(
             tool_name=tool_name,
             args=tool_args,
             reason="HITL required",
+            meta_json=payload,
         )
         if audit_enabled:
             record_tool_call(
@@ -134,12 +307,12 @@ def _execute_tool_with_audit(
                 latency_ms=now_ms(start),
                 kernel_decisions=kernel_decisions,
                 hitl_required=True,
-                hitl_resolution=None,
+                hitl_resolution=hitl_resolution_override,
                 meta_json={"confirmation_token": token},
             )
         raise ToolExecutionError("HITL required")
 
-    if hitl_enabled and hitl_required:
+    if hitl_required:
         record_shadow_confirmation(
             db,
             user_id=user_id,
@@ -149,12 +322,57 @@ def _execute_tool_with_audit(
             tool_name=tool_name,
             args=tool_args,
             reason="HITL required (shadow mode)",
+            meta_json={
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "step_index": step_index,
+                "user_text": user_text,
+                "step_thought": step_thought,
+                "direct_call": direct_call,
+            },
         )
 
-    start = time.monotonic() if audit_enabled else None
     try:
-        result = execute_tool(db, tool_name, tool_args, user_id, agent_id, retries=1)
         if dry_run_enabled and dry_run_required:
+            simulated = execute_dry_run(tool_name, tool_args)
+            record_dry_run(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                args=tool_args,
+                simulated_result=simulated,
+                reason="Dry-run enforced",
+            )
+            if audit_enabled:
+                record_tool_call(
+                    db,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    tool_category=None,
+                    source="agent",
+                    mode="dry_run",
+                    args=tool_args,
+                    result=simulated if isinstance(simulated, dict) else {"result": simulated},
+                    status="dry_run",
+                    error_class=None,
+                    error_message=None,
+                    latency_ms=now_ms(start),
+                    kernel_decisions=kernel_decisions,
+                    hitl_required=hitl_required,
+                    hitl_resolution=hitl_resolution_override,
+                )
+            return simulated
+        result = execute_tool(db, tool_name, tool_args, user_id, agent_id, retries=1)
+        if (not dry_run_enabled) and dry_run_required:
             record_shadow_dry_run(
                 db,
                 user_id=user_id,
@@ -184,10 +402,11 @@ def _execute_tool_with_audit(
                 latency_ms=now_ms(start),
                 kernel_decisions=kernel_decisions,
                 hitl_required=hitl_required,
+                hitl_resolution=hitl_resolution_override,
             )
         return result
     except ToolExecutionError as exc:
-        if audit_enabled:
+        if audit_enabled and not isinstance(exc, PolicyBlockError):
             record_tool_call(
                 db,
                 user_id=user_id,
@@ -206,8 +425,97 @@ def _execute_tool_with_audit(
                 latency_ms=now_ms(start),
                 kernel_decisions=kernel_decisions,
                 hitl_required=hitl_required,
+                hitl_resolution=hitl_resolution_override,
             )
         raise
+
+
+def resume_hitl_confirmation(
+    db: Session,
+    *,
+    confirmation_id: int,
+    resolved_by: str | None = None,
+) -> dict:
+    confirmation = (
+        db.query(ToolConfirmation)
+        .filter(ToolConfirmation.id == confirmation_id)
+        .one_or_none()
+    )
+    if not confirmation:
+        raise ToolExecutionError("HITL confirmation not found")
+    if confirmation.status != "pending":
+        return {"status": confirmation.status}
+
+    lock_key = f"hitl:exec:{confirmation_id}"
+    try:
+        locked = get_redis().set(lock_key, "1", ex=300, nx=True)
+    except Exception:
+        locked = True
+    if not locked:
+        return {"status": "locked"}
+
+    payload = {}
+    if confirmation.meta_json:
+        try:
+            payload = json.loads(confirmation.meta_json)
+        except json.JSONDecodeError:
+            payload = {}
+    if not payload:
+        raise ToolExecutionError("HITL payload missing")
+    if not payload.get("tool_name") or payload.get("user_id") is None:
+        raise ToolExecutionError("HITL payload incomplete")
+
+    confirmation.status = "approved"
+    confirmation.resolved_at = datetime.now(timezone.utc)
+    confirmation.resolved_by = resolved_by
+    db.add(confirmation)
+    db.commit()
+
+    try:
+        result = _execute_tool_with_audit(
+            db,
+            tool_name=payload.get("tool_name"),
+            tool_args=payload.get("tool_args") or {},
+            user_id=int(payload.get("user_id")),
+            agent_id=payload.get("agent_id"),
+            run_id=payload.get("run_id"),
+            step_index=payload.get("step_index"),
+            user_text=payload.get("user_text"),
+            step_thought=payload.get("step_thought"),
+            direct_call=bool(payload.get("direct_call")),
+            allow_hitl_bypass=True,
+            hitl_resolution_override="approved",
+        )
+    except ToolExecutionError as exc:
+        payload_error = _parse_error_payload(exc)
+        run_id = payload.get("run_id")
+        if run_id and payload_error and payload_error.get("status") == "blocked":
+            run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
+            if run:
+                finalize_run(
+                    db,
+                    run,
+                    "blocked",
+                    json.dumps(payload_error, ensure_ascii=True),
+                    None,
+                )
+        raise
+
+    run_id = payload.get("run_id")
+    run_id_int = int(run_id) if run_id is not None else None
+    if run_id_int is not None:
+        run = db.query(AgentRun).filter(AgentRun.id == run_id_int).one_or_none()
+        if run:
+            output_defence_mode = get_mode("output_defence_mode")
+            safe_result = defend_output(result) if output_defence_mode != "off" else result
+            finalize_run(
+                db,
+                run,
+                "completed",
+                json.dumps(safe_result, ensure_ascii=True),
+                None,
+            )
+    return result
 
 
 def execute_agent_run(
@@ -299,6 +607,7 @@ def _execute_run_loop(
     cost_warning_ratio = settings.agent_cost_warning_ratio
     token_warning_ratio = settings.agent_token_warning_ratio
     start_time = time.monotonic()
+    output_defence_mode = get_mode("output_defence_mode")
     total_tokens = int(run.total_tokens or 0)
     total_cost = float(run.total_cost_usd or 0.0)
 
@@ -338,6 +647,7 @@ def _execute_run_loop(
             tool_elapsed = time.monotonic() - start_tool
             if tool_elapsed > tool_kill_switch_seconds:
                 raise ToolExecutionError("Tool execution exceeded kill switch")
+            safe_result = defend_output(result) if output_defence_mode != "off" else result
             add_step(
                 db,
                 run.id,
@@ -346,15 +656,39 @@ def _execute_run_loop(
                 "success",
                 tool_name=direct_tool["name"],
                 input_data=tool_args,
-                output_data=result,
+                output_data=safe_result,
                 reasoning={
                     **direct_reasoning,
                     "success_reason": "Tool executed successfully via direct invocation.",
                 },
             )
-            finalize_run(db, run, "completed", json.dumps(result, ensure_ascii=True), None)
+            finalize_run(db, run, "completed", json.dumps(safe_result, ensure_ascii=True), None)
             return run
         except ToolExecutionError as exc:
+            payload = _parse_error_payload(exc)
+            if payload and payload.get("status") == "blocked":
+                add_step(
+                    db,
+                    run.id,
+                    1,
+                    "tool",
+                    "blocked",
+                    tool_name=direct_tool["name"],
+                    input_data=tool_args,
+                    output_data=payload,
+                    reasoning={
+                        **direct_reasoning,
+                        "failure_root_cause": payload.get("message") or str(exc),
+                    },
+                )
+                finalize_run(
+                    db,
+                    run,
+                    "blocked",
+                    json.dumps(payload, ensure_ascii=True),
+                    None,
+                )
+                return run
             add_step(
                 db,
                 run.id,
@@ -363,7 +697,7 @@ def _execute_run_loop(
                 "failed",
                 tool_name=direct_tool["name"],
                 input_data=tool_args,
-                output_data={"error": str(exc)},
+                output_data=payload or {"error": str(exc)},
                 reasoning={
                     **direct_reasoning,
                     "failure_root_cause": str(exc),
@@ -584,6 +918,8 @@ def _execute_run_loop(
             continue
 
         if action == "final":
+            final_output = _resolve_final_output(step_to_execute.final_answer, last_tool_output)
+            safe_answer = defend_output(final_output) if output_defence_mode != "off" else final_output
             add_step(
                 db,
                 run.id,
@@ -591,10 +927,10 @@ def _execute_run_loop(
                 "final",
                 "success",
                 thought=step_to_execute.thought,
-                output_data={"final_answer": step_to_execute.final_answer},
+                output_data={"final_answer": safe_answer},
                 reasoning={"success_reason": "Final answer produced"},
             )
-            finalize_run(db, run, "completed", step_to_execute.final_answer or "", None)
+            finalize_run(db, run, "completed", safe_answer or "", None)
             logger.info("agent_run_completed", extra={"run_id": run.id, "steps": step_number})
             return run
 
@@ -648,6 +984,7 @@ def _execute_run_loop(
                     tool_elapsed = time.monotonic() - start_tool
                     if tool_elapsed > tool_kill_switch_seconds:
                         raise ToolExecutionError("Tool execution exceeded kill switch")
+                    safe_result = defend_output(result) if output_defence_mode != "off" else result
                     status = "success" if attempt == 0 else "retry"
                     add_step(
                         db,
@@ -658,7 +995,7 @@ def _execute_run_loop(
                         thought=step_to_execute.thought,
                         tool_name=selected_tool,
                         input_data=tool_args,
-                        output_data=result,
+                        output_data=safe_result,
                         reasoning={
                             "selected_tool_reason": selected_reason,
                             "rejected_tools_reason": rejected_reasons,
@@ -685,6 +1022,33 @@ def _execute_run_loop(
                     )
                     break
                 except ToolExecutionError as exc:
+                    payload = _parse_error_payload(exc)
+                    if payload and payload.get("status") == "blocked":
+                        add_step(
+                            db,
+                            run.id,
+                            step_number,
+                            "tool",
+                            "blocked",
+                            thought=step_to_execute.thought,
+                            tool_name=selected_tool,
+                            input_data=tool_args,
+                            output_data=payload,
+                            reasoning={
+                                "selected_tool_reason": selected_reason,
+                                "rejected_tools_reason": rejected_reasons,
+                                "scoring_breakdown": scoring_breakdown,
+                                "failure_root_cause": payload.get("message") or str(exc),
+                            },
+                        )
+                        finalize_run(
+                            db,
+                            run,
+                            "blocked",
+                            json.dumps(payload, ensure_ascii=True),
+                            None,
+                        )
+                        return run
                     tool_failure_counts[selected_tool] = tool_failure_counts.get(selected_tool, 0) + 1
                     if tool_failure_counts[selected_tool] > max_tool_failures:
                         add_step(
@@ -708,7 +1072,7 @@ def _execute_run_loop(
                         thought=step_to_execute.thought,
                         tool_name=selected_tool,
                         input_data=tool_args,
-                        output_data={"error": str(exc)},
+                        output_data=payload or {"error": str(exc)},
                         reasoning={
                             "selected_tool_reason": selected_reason,
                             "rejected_tools_reason": rejected_reasons,
