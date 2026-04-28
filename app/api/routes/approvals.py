@@ -14,6 +14,7 @@ router = APIRouter()
 
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send"
 CALENDAR_EVENT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
+CALENDAR_EVENT_DETAIL_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}"
 
 
 class ApprovalResolution(BaseModel):
@@ -76,6 +77,34 @@ def approve(approval_id: int, payload: ApprovalResolution, db: Session = Depends
         )
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to create calendar event")
+
+    if approval.type == "calendar.update":
+        data = json.loads(approval.payload)
+        calendar_id = data.get("calendar_id")
+        event_id = data.get("event_id")
+        if not calendar_id or not event_id:
+            raise HTTPException(status_code=400, detail="Missing calendar_id/event_id")
+
+        if not approval.user_id:
+            raise HTTPException(status_code=400, detail="Approval missing user")
+        account = _ensure_token(db, _get_default_account(db, approval.user_id))
+        headers = {"Authorization": f"Bearer {account.access_token}"}
+
+        body = {}
+        for key in ("summary", "description", "start", "end", "attendees"):
+            if data.get(key) is not None:
+                body[key] = data.get(key)
+        if not body:
+            raise HTTPException(status_code=400, detail="Missing update fields")
+
+        response = httpx.patch(
+            CALENDAR_EVENT_DETAIL_URL.format(calendar_id=calendar_id, event_id=event_id),
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to update calendar event")
 
     approval.status = "approved"
     approval.resolved_by = payload.resolved_by

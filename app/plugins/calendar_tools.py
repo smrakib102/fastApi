@@ -34,6 +34,18 @@ def _create_request(args: dict, ctx: ToolContext) -> dict:
     return _calendar_create_request(args, ctx.db, ctx.user_id, ctx.agent_id)
 
 
+def _list_events(args: dict, ctx: ToolContext) -> dict:
+    from app.api.routes.tools import _calendar_list_events
+
+    return _calendar_list_events(args, ctx.db, ctx.user_id)
+
+
+def _update_request(args: dict, ctx: ToolContext) -> dict:
+    from app.api.routes.tools import _calendar_update_request
+
+    return _calendar_update_request(args, ctx.db, ctx.user_id, ctx.agent_id)
+
+
 def register(registry) -> None:
     registry.add(
         Plugin(
@@ -46,10 +58,28 @@ def register(registry) -> None:
     )
     registry.add(
         Plugin(
+            name="calendar.list_events",
+            handler=_wrap(_list_events),
+            category="calendar",
+            description="List events from a Google calendar.",
+            required_scopes=["calendar.readonly"],
+        )
+    )
+    registry.add(
+        Plugin(
             name="calendar.create_request",
             handler=_wrap(_create_request),
             category="calendar",
             description="Create an approval request to add a calendar event.",
+            required_scopes=["calendar.events"],
+        )
+    )
+    registry.add(
+        Plugin(
+            name="calendar.update_request",
+            handler=_wrap(_update_request),
+            category="calendar",
+            description="Create an approval request to update a calendar event.",
             required_scopes=["calendar.events"],
         )
     )

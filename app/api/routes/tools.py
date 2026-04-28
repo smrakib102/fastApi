@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import httpx
@@ -28,6 +29,7 @@ _nonce_cache: dict[str, float] = {}
 GMAIL_DRAFT_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send"
 CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
+CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
 GMAIL_PROFILE_URL = "https://www.googleapis.com/gmail/v1/users/me/profile"
 GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
@@ -170,8 +172,12 @@ def _execute_tool_internal(
         return _gmail_profile(db, internal_user_id)
     if payload.name == "calendar.list":
         return _calendar_list(db, internal_user_id)
+    if payload.name == "calendar.list_events":
+        return _calendar_list_events(payload.arguments, db, internal_user_id)
     if payload.name == "calendar.create_request":
         return _calendar_create_request(payload.arguments, db, internal_user_id, internal_agent_id)
+    if payload.name == "calendar.update_request":
+        return _calendar_update_request(payload.arguments, db, internal_user_id, internal_agent_id)
     if payload.name == "gmail.list_messages":
         return _gmail_list_messages(payload.arguments, db, internal_user_id)
     if payload.name == "gmail.list_drafts":
@@ -260,6 +266,44 @@ def _calendar_list(db: Session, user_id: int) -> dict:
     response = httpx.get(CALENDAR_LIST_URL, headers=headers, timeout=30)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch calendar list")
+    return response.json()
+
+
+def _calendar_list_events(args: dict, db: Session, user_id: int) -> dict:
+    calendar_id = args.get("calendar_id") or "primary"
+    time_min = args.get("time_min")
+    time_max = args.get("time_max")
+    if not time_min and not time_max:
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        time_min = start.isoformat()
+        time_max = end.isoformat()
+
+    max_results = args.get("max_results", 50)
+    query = args.get("q")
+    single_events = args.get("single_events", True)
+    order_by = args.get("order_by", "startTime")
+
+    account = _ensure_token(db, _get_default_account(db, user_id))
+    headers = {"Authorization": f"Bearer {account.access_token}"}
+    params = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "maxResults": max_results,
+        "singleEvents": single_events,
+        "orderBy": order_by,
+    }
+    if query:
+        params["q"] = query
+
+    response = httpx.get(
+        CALENDAR_EVENTS_URL.format(calendar_id=calendar_id),
+        headers=headers,
+        params={k: v for k, v in params.items() if v is not None},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to fetch calendar events")
     return response.json()
 
 
@@ -358,6 +402,41 @@ def _calendar_create_request(args: dict, db: Session, user_id: int, agent_id: in
     return {"approval_id": approval.id, "status": approval.status}
 
 
+def _calendar_update_request(args: dict, db: Session, user_id: int, agent_id: int | None) -> dict:
+    calendar_id = args.get("calendar_id")
+    event_id = args.get("event_id")
+    if not calendar_id or not event_id:
+        raise HTTPException(status_code=400, detail="Missing calendar_id/event_id")
+
+    has_updates = any(
+        args.get(key) is not None for key in ("summary", "description", "start", "end", "attendees")
+    )
+    if not has_updates:
+        raise HTTPException(status_code=400, detail="Missing update fields")
+
+    approval = Approval(
+        user_id=user_id,
+        agent_id=agent_id,
+        type="calendar.update",
+        payload=json.dumps(
+            {
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+                "summary": args.get("summary"),
+                "description": args.get("description"),
+                "start": args.get("start"),
+                "end": args.get("end"),
+                "attendees": args.get("attendees"),
+            }
+        ),
+    )
+    db.add(approval)
+    db.commit()
+    db.refresh(approval)
+
+    return {"approval_id": approval.id, "status": approval.status}
+
+
 @router.get("/manifest")
 def tool_manifest(x_tool_token: str | None = Header(default=None)):
     _require_tool_token(x_tool_token)
@@ -420,6 +499,23 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                 },
             },
             {
+                "name": "calendar.list_events",
+                "description": "List events from a Google calendar.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "calendar_id": {"type": "string"},
+                        "time_min": {"type": "string"},
+                        "time_max": {"type": "string"},
+                        "q": {"type": "string"},
+                        "max_results": {"type": "integer"},
+                        "single_events": {"type": "boolean"},
+                        "order_by": {"type": "string"},
+                    },
+                    "required": [],
+                },
+            },
+            {
                 "name": "calendar.create_request",
                 "description": "Create an approval request for a calendar event.",
                 "input_schema": {
@@ -433,6 +529,23 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                         "attendees": {"type": "array"},
                     },
                     "required": ["calendar_id", "summary", "start", "end"],
+                },
+            },
+            {
+                "name": "calendar.update_request",
+                "description": "Create an approval request to update a calendar event.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "calendar_id": {"type": "string"},
+                        "event_id": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "description": {"type": "string"},
+                        "start": {"type": "object"},
+                        "end": {"type": "object"},
+                        "attendees": {"type": "array"},
+                    },
+                    "required": ["calendar_id", "event_id"],
                 },
             },
             {

@@ -20,6 +20,21 @@ def execute_dry_run(tool_name: str, args: dict) -> dict:
             "calendar_id": args.get("calendar_id"),
             "summary": args.get("summary"),
         }
+    if tool_name == "calendar.list_events":
+        return {
+            "status": "dry_run",
+            "note": "Would list calendar events.",
+            "calendar_id": args.get("calendar_id"),
+            "time_min": args.get("time_min"),
+            "time_max": args.get("time_max"),
+        }
+    if tool_name == "calendar.update_request":
+        return {
+            "status": "dry_run",
+            "note": "Would create calendar update request.",
+            "calendar_id": args.get("calendar_id"),
+            "event_id": args.get("event_id"),
+        }
     if tool_name == "api.request":
         return {
             "status": "dry_run",
