@@ -109,6 +109,13 @@ class Settings(BaseSettings):
     # Celery task. The engine itself is import-safe at all times.
     workflow_engine_enabled: bool = False
 
+    # --- Calendar write controls --------------------------------------------
+    # When True, calendar.create_request will execute immediately without
+    # a manual approval step.
+    calendar_auto_approve_writes: bool = False
+    # Optional comma-separated user IDs that bypass calendar approvals.
+    calendar_auto_approve_user_ids: str | None = None
+
     # --- v4 production governance: foundation flags --------------------------
     # All flags default to OFF / "off" so this rollout is a pure no-op in prod
     # until each phase is deliberately turned on (DB-backed admin toggle, with

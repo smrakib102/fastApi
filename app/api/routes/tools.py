@@ -174,6 +174,8 @@ def _execute_tool_internal(
         return _calendar_list(db, internal_user_id)
     if payload.name == "calendar.list_events":
         return _calendar_list_events(payload.arguments, db, internal_user_id)
+    if payload.name == "calendar.create":
+        return _calendar_create(payload.arguments, db, internal_user_id)
     if payload.name == "calendar.create_request":
         return _calendar_create_request(payload.arguments, db, internal_user_id, internal_agent_id)
     if payload.name == "calendar.update_request":
@@ -380,6 +382,9 @@ def _calendar_create_request(args: dict, db: Session, user_id: int, agent_id: in
     if not calendar_id or not summary or not start or not end:
         raise HTTPException(status_code=400, detail="Missing calendar fields")
 
+    if _calendar_auto_approve(user_id):
+        return _calendar_create(args, db, user_id)
+
     approval = Approval(
         user_id=user_id,
         agent_id=agent_id,
@@ -400,6 +405,50 @@ def _calendar_create_request(args: dict, db: Session, user_id: int, agent_id: in
     db.refresh(approval)
 
     return {"approval_id": approval.id, "status": approval.status}
+
+
+def _calendar_auto_approve(user_id: int) -> bool:
+    if settings.calendar_auto_approve_writes:
+        return True
+    raw_ids = settings.calendar_auto_approve_user_ids
+    if not raw_ids:
+        return False
+    try:
+        allowed = {int(item.strip()) for item in raw_ids.split(",") if item.strip()}
+    except ValueError:
+        return False
+    return int(user_id) in allowed
+
+
+def _calendar_create(args: dict, db: Session, user_id: int) -> dict:
+    calendar_id = args.get("calendar_id") or "primary"
+    summary = args.get("summary")
+    start = args.get("start")
+    end = args.get("end")
+    if not summary or not start or not end:
+        raise HTTPException(status_code=400, detail="Missing calendar fields")
+
+    account = _ensure_token(db, _get_default_account(db, user_id))
+    headers = {"Authorization": f"Bearer {account.access_token}"}
+    body = {
+        "summary": summary,
+        "description": args.get("description"),
+        "start": start,
+        "end": end,
+    }
+    attendees = args.get("attendees")
+    if attendees:
+        body["attendees"] = attendees
+
+    response = httpx.post(
+        CALENDAR_EVENTS_URL.format(calendar_id=calendar_id),
+        headers=headers,
+        json=body,
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to create calendar event")
+    return response.json()
 
 
 def _calendar_update_request(args: dict, db: Session, user_id: int, agent_id: int | None) -> dict:
@@ -513,6 +562,22 @@ def tool_manifest(x_tool_token: str | None = Header(default=None)):
                         "order_by": {"type": "string"},
                     },
                     "required": [],
+                },
+            },
+            {
+                "name": "calendar.create",
+                "description": "Create a calendar event immediately.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "calendar_id": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "description": {"type": "string"},
+                        "start": {"type": "object"},
+                        "end": {"type": "object"},
+                        "attendees": {"type": "array"},
+                    },
+                    "required": ["summary", "start", "end"],
                 },
             },
             {

@@ -34,6 +34,12 @@ def _create_request(args: dict, ctx: ToolContext) -> dict:
     return _calendar_create_request(args, ctx.db, ctx.user_id, ctx.agent_id)
 
 
+def _create(args: dict, ctx: ToolContext) -> dict:
+    from app.api.routes.tools import _calendar_create
+
+    return _calendar_create(args, ctx.db, ctx.user_id)
+
+
 def _list_events(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _calendar_list_events
 
@@ -71,6 +77,15 @@ def register(registry) -> None:
             handler=_wrap(_create_request),
             category="calendar",
             description="Create an approval request to add a calendar event.",
+            required_scopes=["calendar.events"],
+        )
+    )
+    registry.add(
+        Plugin(
+            name="calendar.create",
+            handler=_wrap(_create),
+            category="calendar",
+            description="Create a calendar event immediately.",
             required_scopes=["calendar.events"],
         )
     )

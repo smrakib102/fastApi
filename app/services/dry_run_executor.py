@@ -20,6 +20,13 @@ def execute_dry_run(tool_name: str, args: dict) -> dict:
             "calendar_id": args.get("calendar_id"),
             "summary": args.get("summary"),
         }
+    if tool_name == "calendar.create":
+        return {
+            "status": "dry_run",
+            "note": "Would create calendar event.",
+            "calendar_id": args.get("calendar_id"),
+            "summary": args.get("summary"),
+        }
     if tool_name == "calendar.list_events":
         return {
             "status": "dry_run",
