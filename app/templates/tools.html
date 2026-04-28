@@ -125,7 +125,7 @@
             disconnectGoogleBtn.disabled = true;
             disconnectGoogleBtn.textContent = "Disconnecting...";
             try {
-                const response = await fetch("/google_oauth/disconnect", { method: "DELETE" });
+                const response = await fetch("/google/disconnect", { method: "DELETE" });
                 if (response.ok) {
                     window.location.reload();
                 } else {
