@@ -7,6 +7,13 @@
         <h2>Tool connections</h2>
         <p>Manage integrations used by your agents.</p>
     </div>
+    {% set google_error = request.query_params.get("google_error") %}
+    {% set google_connected_notice = request.query_params.get("google_connected") %}
+    {% if google_error %}
+        <div class="form-error">Google connection failed: {{ google_error }}</div>
+    {% elif google_connected_notice %}
+        <div class="form-success">Google account connected.</div>
+    {% endif %}
     <div class="panel-grid">
         <div class="panel-card">
             <div class="panel-title">Telegram</div>

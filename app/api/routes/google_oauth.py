@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
 import httpx
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -172,61 +173,65 @@ def google_oauth_callback(
 ):
     _require_google_config()
 
-    redis_client = get_redis()
-    state_key = f"oauth:state:{state}"
-    user_id = redis_client.get(state_key)
-    if not user_id:
-        raise HTTPException(status_code=400, detail="OAuth state is invalid or expired")
-    redis_client.delete(state_key)
+    try:
+        redis_client = get_redis()
+        state_key = f"oauth:state:{state}"
+        user_id = redis_client.get(state_key)
+        if not user_id:
+            raise HTTPException(status_code=400, detail="OAuth state is invalid or expired")
+        redis_client.delete(state_key)
 
-    payload = {
-        "client_id": settings.google_oauth_client_id,
-        "client_secret": settings.google_oauth_client_secret,
-        "code": code,
-        "grant_type": "authorization_code",
-        "redirect_uri": settings.google_oauth_redirect_uri,
-    }
+        payload = {
+            "client_id": settings.google_oauth_client_id,
+            "client_secret": settings.google_oauth_client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": settings.google_oauth_redirect_uri,
+        }
 
-    token_resp = httpx.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
-    if token_resp.status_code != 200:
-        raise HTTPException(status_code=400, detail="Token exchange failed")
+        token_resp = httpx.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
+        if token_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Token exchange failed")
 
-    tokens = token_resp.json()
-    access_token = tokens["access_token"]
-    refresh_token = tokens.get("refresh_token")
-    token_type = tokens.get("token_type", "Bearer")
-    scope = tokens.get("scope")
-    expires_in = tokens.get("expires_in")
+        tokens = token_resp.json()
+        access_token = tokens["access_token"]
+        refresh_token = tokens.get("refresh_token")
+        token_type = tokens.get("token_type", "Bearer")
+        scope = tokens.get("scope")
+        expires_in = tokens.get("expires_in")
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    userinfo = httpx.get(GOOGLE_USERINFO_URL, headers=headers, timeout=30)
-    if userinfo.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to read user profile")
+        headers = {"Authorization": f"Bearer {access_token}"}
+        userinfo = httpx.get(GOOGLE_USERINFO_URL, headers=headers, timeout=30)
+        if userinfo.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to read user profile")
 
-    profile = userinfo.json()
-    account_email = profile.get("email") or "unknown"
+        profile = userinfo.json()
+        account_email = profile.get("email") or "unknown"
 
-    account = db.execute(
-        select(GoogleAccount).where(GoogleAccount.account_email == account_email)
-    ).scalar_one_or_none()
+        account = db.execute(
+            select(GoogleAccount).where(GoogleAccount.account_email == account_email)
+        ).scalar_one_or_none()
 
-    if not account:
-        account = GoogleAccount(account_email=account_email, access_token=access_token)
+        if not account:
+            account = GoogleAccount(account_email=account_email, access_token=access_token)
 
-    account.access_token = access_token
-    account.user_id = int(user_id)
-    if refresh_token:
-        account.refresh_token = refresh_token
-    account.token_type = token_type
-    account.scope = scope
-    if expires_in:
-        account.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        account.access_token = access_token
+        account.user_id = int(user_id)
+        if refresh_token:
+            account.refresh_token = refresh_token
+        account.token_type = token_type
+        account.scope = scope
+        if expires_in:
+            account.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    db.add(account)
-    db.commit()
-    db.refresh(account)
+        db.add(account)
+        db.commit()
+        db.refresh(account)
+    except HTTPException as exc:
+        error_msg = quote_plus(str(exc.detail))
+        return RedirectResponse(f"/tools?google_error={error_msg}", status_code=303)
 
-    return {"ok": True, "email": account.account_email}
+    return RedirectResponse("/tools?google_connected=1", status_code=303)
 
 
 @router.get("/gmail/profile")
