@@ -17,8 +17,26 @@
     <div class="panel-grid">
         <div class="panel-card">
             <div class="panel-title">Telegram</div>
-            <div class="muted">Connect your bot to enable chat-based workflows.</div>
-            <button class="btn" id="connect-telegram">Connect Telegram</button>
+            <div class="muted">Connect your own Telegram bot to enable chat-based workflows.</div>
+            <div class="form-stack" style="margin-top:12px;">
+                <label>
+                    <span>Bot token</span>
+                    <input type="text" id="telegram-bot-token" placeholder="Paste the token from BotFather" />
+                </label>
+                <details>
+                    <summary>How to get a bot token</summary>
+                    <ol class="muted" style="margin-top:8px;">
+                        <li>Open Telegram and search for BotFather.</li>
+                        <li>Send <code>/newbot</code> and follow the prompts.</li>
+                        <li>Copy the bot token BotFather gives you.</li>
+                        <li>Paste the token above and click Connect.</li>
+                    </ol>
+                </details>
+                <div class="row" style="gap:8px; flex-wrap:wrap;">
+                    <button class="btn" id="connect-telegram">Connect Telegram</button>
+                    <button class="btn btn-danger" id="disconnect-telegram" style="display:none;">Disconnect</button>
+                </div>
+            </div>
             <div class="chat-status" id="telegram-status"></div>
         </div>
         <div class="panel-card">
@@ -48,6 +66,8 @@
 
 <script>
     const connectBtn = document.getElementById("connect-telegram");
+    const disconnectBtn = document.getElementById("disconnect-telegram");
+    const tokenInput = document.getElementById("telegram-bot-token");
     const statusEl = document.getElementById("telegram-status");
     const googleBtn = document.getElementById("connect-google");
     const googleStatus = document.getElementById("google-status");
@@ -58,27 +78,27 @@
             statusEl.textContent = "Unable to read Telegram status.";
             return;
         }
-        if (payload.connected) {
+        if (payload.bot_connected) {
             const displayName = payload.display_name || "telegram-user";
             statusEl.textContent = `Connected as ${displayName}.`;
             if (payload.bot_username) {
                 statusEl.textContent += ` Bot: @${payload.bot_username}.`;
             }
+            if (payload.start_link) {
+                statusEl.innerHTML += ` <a href="${payload.start_link}" target="_blank">Open Telegram</a>.`;
+            }
             connectBtn.disabled = true;
             connectBtn.textContent = "Connected";
-            return;
-        }
-
-        if (!payload.bot_username) {
-            statusEl.textContent = "Bot username not configured.";
-            connectBtn.disabled = false;
-            connectBtn.textContent = "Connect Telegram";
+            disconnectBtn.style.display = "inline-block";
+            tokenInput.disabled = true;
             return;
         }
 
         statusEl.textContent = "Not connected yet.";
         connectBtn.disabled = false;
         connectBtn.textContent = "Connect Telegram";
+        disconnectBtn.style.display = "none";
+        tokenInput.disabled = false;
     }
 
     async function loadTelegramStatus() {
@@ -92,18 +112,46 @@
     }
 
     connectBtn.addEventListener("click", async () => {
-        statusEl.textContent = "Generating link...";
-        const response = await fetch("/telegram/link-token", { method: "POST" });
+        const botToken = tokenInput.value.trim();
+        if (!botToken) {
+            statusEl.textContent = "Please paste your bot token first.";
+            return;
+        }
+        statusEl.textContent = "Connecting...";
+        const response = await fetch("/telegram/connect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bot_token: botToken }),
+        });
         if (!response.ok) {
-            statusEl.textContent = "Unable to generate link.";
+            const errorText = await response.text();
+            statusEl.textContent = `Unable to connect: ${errorText}`;
             return;
         }
         const payload = await response.json();
-        if (payload.link) {
-            statusEl.innerHTML = `Open <a href=\"${payload.link}\" target=\"_blank\">Telegram link</a> to connect.`;
+        if (payload.start_link) {
+            statusEl.innerHTML = `Connected. <a href=\"${payload.start_link}\" target=\"_blank\">Open Telegram</a> to finish setup.`;
+            window.open(payload.start_link, "_blank");
         } else {
-            statusEl.textContent = "Bot username not configured.";
+            statusEl.textContent = "Connected, but the bot username was not returned.";
         }
+        loadTelegramStatus();
+    });
+
+    disconnectBtn.addEventListener("click", async () => {
+        disconnectBtn.disabled = true;
+        disconnectBtn.textContent = "Disconnecting...";
+        const response = await fetch("/telegram/disconnect", { method: "POST" });
+        if (!response.ok) {
+            disconnectBtn.disabled = false;
+            disconnectBtn.textContent = "Disconnect";
+            statusEl.textContent = "Unable to disconnect.";
+            return;
+        }
+        disconnectBtn.disabled = false;
+        disconnectBtn.textContent = "Disconnect";
+        tokenInput.value = "";
+        loadTelegramStatus();
     });
 
     if (googleBtn) {

@@ -31,6 +31,7 @@ from app.models.user_limit import UserLimit
 from app.services.audit_log import record_audit
 from app.services.agent_executor import ToolExecutionError
 from app.services.email_service import send_email
+from app.services.telegram_health import get_telegram_status
 
 router = APIRouter()
 
@@ -253,6 +254,14 @@ def list_plugins(
             for p in plugin_registry.all()
         ],
     }
+
+
+@router.get("/telegram-status")
+def telegram_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_user),
+):
+    return get_telegram_status(db)
 
 
 @router.post("/settings")

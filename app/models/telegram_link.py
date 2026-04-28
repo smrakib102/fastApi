@@ -14,5 +14,5 @@ class TelegramLink(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("telegram_user_id", name="telegram_links_user_unique"),
+        UniqueConstraint("user_id", "telegram_user_id", name="telegram_links_user_tg_unique"),
     )

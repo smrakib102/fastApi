@@ -332,7 +332,7 @@ def _agent_needs_telegram_group(spec: AgentSpec, raw_text: str) -> bool:
     return has_telegram_tool or mentions_group
 
 
-def _telegram_group_setup_block(db: Session) -> str | None:
+def _telegram_group_setup_block(db: Session, user_id: int) -> str | None:
     """Render a one-tap invite link + short next-steps guide. None if the
     bot username isn't configured (so we don't print a broken link)."""
     # Local imports to avoid a top-level cycle: telegram.py imports the
@@ -340,7 +340,7 @@ def _telegram_group_setup_block(db: Session) -> str | None:
     from app.api.routes.telegram import _get_bot_username
     from app.services.telegram_group_helpers import build_group_invite_link
 
-    bot_username = _get_bot_username(db)
+    bot_username = _get_bot_username(db, user_id)
     invite = build_group_invite_link(bot_username)
     if not invite:
         return None
@@ -369,7 +369,7 @@ def _build_telegram_group_picker_action(
     from app.models.telegram_message import TelegramMessage
     from app.services.telegram_group_helpers import build_group_invite_link
 
-    bot_username = _get_bot_username(db)
+    bot_username = _get_bot_username(db, user_id)
     invite_url = build_group_invite_link(bot_username)
 
     # Distinct (chat_id, chat_type) pairs the user has been seen in
@@ -513,7 +513,7 @@ class AgentBuilder:
             else:
                 # Fall back to the plain invite link if we couldn't build
                 # the picker (e.g., bot username not configured).
-                fallback = _telegram_group_setup_block(db)
+                fallback = _telegram_group_setup_block(db, user.id)
                 if fallback:
                     confirmation += "\n\n" + fallback
 

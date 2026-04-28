@@ -15,6 +15,7 @@ from app.models.model_performance import ModelPerformance
 from app.models.reminder import Reminder
 from app.models.task import Task
 from app.models.telegram_link import TelegramLink
+from app.models.telegram_bot import TelegramBot
 from app.models.telegram_message import TelegramMessage
 from app.models.summary_schedule import SummarySchedule
 from app.models.team import Team
@@ -49,6 +50,7 @@ __all__ = [
 	"Reminder",
 	"Task",
 	"TelegramLink",
+	"TelegramBot",
 	"TelegramMessage",
 	"SummarySchedule",
 	"Team",

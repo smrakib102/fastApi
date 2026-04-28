@@ -24,6 +24,7 @@ from app.services.telegram_group_helpers import (
 from app.services.telegram_service import send_message
 from app.worker.celery_app import celery_app
 from app.core.config import settings
+from app.services.telegram_bot_store import get_user_bot_username
 
 
 @celery_app.task(name="app.worker.tasks.ping")
@@ -60,7 +61,7 @@ def _dm_user(db, user_id: int, text: str) -> None:
     if not link or not link.telegram_user_id:
         return
     try:
-        send_message(db, str(link.telegram_user_id), text)
+        send_message(db, str(link.telegram_user_id), text, user_id=user_id)
     except Exception:  # noqa: BLE001
         logger.exception("dm_user_failed", extra={"user_id": user_id})
 
@@ -69,7 +70,7 @@ def _maybe_warn_bot_not_in_group(db, schedule, response: dict | None) -> None:
     """If Telegram says we can't reach the group, DM the owner an invite link."""
     if not is_bot_not_in_chat_error(response):
         return
-    bot_username = settings.telegram_bot_username
+    bot_username = get_user_bot_username(db, schedule.user_id) or settings.telegram_bot_username
     invite = build_group_invite_link(bot_username)
     msg_lines = [
         "⚠️ I tried to send your scheduled summary but I can't read that group.",
@@ -113,7 +114,7 @@ def send_summaries():
                     db, schedule.user_id, schedule.chat_id
                 )
                 message = branded_summary(agent_name, body, kind="Daily summary")
-                response = send_message(db, schedule.chat_id, message)
+                response = send_message(db, schedule.chat_id, message, user_id=schedule.user_id)
                 _maybe_warn_bot_not_in_group(db, schedule, response)
                 schedule.last_sent_at = now_utc
                 db.add(schedule)

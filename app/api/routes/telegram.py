@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from app.core.redis_client import get_redis
 from app.models.employee import Employee
 from app.core.crypto import decrypt_value, encrypt_value
 from app.models.admin_setting import AdminSetting
+from app.models.telegram_bot import TelegramBot
 from app.models.telegram_link import TelegramLink
 from app.models.tool_request import ToolRequest
 from app.models.tool_registry import ToolRegistry
@@ -26,6 +27,12 @@ from app.models.agent_template import AgentTemplate
 from app.services.agent_runtime import AgentRuntimeError, execute_agent_run
 from app.models.agent import Agent
 from app.services.audit_log import record_audit
+from app.services.telegram_bot_store import (
+    get_bot_by_webhook_secret,
+    get_user_bot,
+    get_user_bot_token,
+    get_user_bot_username,
+)
 
 router = APIRouter()
 
@@ -136,20 +143,69 @@ def _is_new_agent(text: str | None) -> bool:
     return bool(text and text.strip() == "/newagent")
 
 
-def _get_bot_username(db: Session) -> str | None:
+def _get_bot_user_id(db: Session) -> int | None:
+    try:
+        return db.info.get("telegram_bot_user_id")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _get_bot_username(db: Session, user_id: int | None = None) -> str | None:
+    try:
+        cached = db.info.get("telegram_bot_username")
+        if cached:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+
+    if user_id is None:
+        user_id = _get_bot_user_id(db)
+    if user_id is not None:
+        username = get_user_bot_username(db, user_id)
+        if username:
+            return username
+
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_username")
     ).scalar_one_or_none()
     return setting.value if setting and setting.value else settings.telegram_bot_username
 
 
-def _get_bot_token(db: Session) -> str | None:
+def _get_bot_token(db: Session, user_id: int | None = None) -> str | None:
+    try:
+        cached = db.info.get("telegram_bot_token")
+        if cached:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+
+    if user_id is None:
+        user_id = _get_bot_user_id(db)
+    if user_id is not None:
+        token = get_user_bot_token(db, user_id)
+        if token:
+            return token
+
     setting = db.execute(
         select(AdminSetting).where(AdminSetting.key == "telegram_bot_token")
     ).scalar_one_or_none()
     if settings.secrets_env_only:
         return settings.telegram_bot_token
     return decrypt_value(setting.value) if setting and setting.value else settings.telegram_bot_token
+
+
+def _get_link(
+    db: Session,
+    telegram_user_id: str,
+    *,
+    user_id: int | None = None,
+) -> TelegramLink | None:
+    if user_id is None:
+        user_id = _get_bot_user_id(db)
+    stmt = select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
+    if user_id is not None:
+        stmt = stmt.where(TelegramLink.user_id == user_id)
+    return db.execute(stmt).scalar_one_or_none()
 
 
 def _send_message(db: Session, chat_id: str, text: str, reply_markup: dict | None = None) -> None:
@@ -487,25 +543,193 @@ def _send_welcome(db: Session, chat_id: str) -> None:
 
 
 
+@router.post("/connect")
+def connect_telegram(
+    payload: dict = Body(...),
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    if settings.secrets_env_only:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SECRETS_ENV_ONLY is enabled. Telegram bot tokens must be set via environment variables."
+            ),
+        )
+    bot_token = (payload.get("bot_token") or "").strip()
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="bot_token is required")
+    if not settings.public_base_url:
+        raise HTTPException(status_code=400, detail="public_base_url not configured")
+
+    try:
+        me_resp = httpx.get(
+            f"https://api.telegram.org/bot{bot_token}/getMe",
+            timeout=15,
+        )
+        me_data = me_resp.json()
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.exception("telegram_getme_failed")
+        raise HTTPException(status_code=502, detail=f"telegram_api_error: {exc}")
+
+    if not me_data.get("ok"):
+        raise HTTPException(status_code=400, detail=me_data)
+
+    bot_result = me_data.get("result", {})
+    bot_username = bot_result.get("username")
+    bot_id = str(bot_result.get("id") or "") or None
+
+    webhook_secret = secrets.token_urlsafe(24)
+    webhook_url = settings.public_base_url.rstrip("/") + "/telegram/webhook"
+
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/setWebhook",
+            json={
+                "url": webhook_url,
+                "secret_token": webhook_secret,
+                "drop_pending_updates": True,
+                "allowed_updates": [
+                    "message",
+                    "edited_message",
+                    "callback_query",
+                    "my_chat_member",
+                ],
+            },
+            timeout=20,
+        )
+        data = resp.json()
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.exception("telegram_set_webhook_failed")
+        raise HTTPException(status_code=502, detail=f"telegram_api_error: {exc}")
+
+    if not data.get("ok"):
+        logger.error("telegram_set_webhook_rejected", extra={"response": data})
+        raise HTTPException(status_code=502, detail=data)
+
+    existing = get_user_bot(db, current_user.id, active_only=False)
+    start_token = existing.start_token if existing and existing.start_token else secrets.token_urlsafe(16)
+    encrypted_token = encrypt_value(bot_token)
+    now = datetime.now(timezone.utc)
+    if existing:
+        existing.bot_token = encrypted_token
+        existing.bot_username = bot_username
+        existing.bot_id = bot_id
+        existing.webhook_secret = webhook_secret
+        existing.start_token = start_token
+        existing.status = "active"
+        existing.connected_at = now
+        existing.disconnected_at = None
+        db.add(existing)
+    else:
+        db.add(
+            TelegramBot(
+                user_id=current_user.id,
+                bot_token=encrypted_token,
+                bot_username=bot_username,
+                bot_id=bot_id,
+                webhook_secret=webhook_secret,
+                start_token=start_token,
+                status="active",
+                connected_at=now,
+            )
+        )
+    db.commit()
+
+    commands_result: dict | None = None
+    try:
+        commands_result = _set_bot_commands(bot_token)
+    except Exception:  # noqa: BLE001
+        logger.exception("telegram_set_commands_failed")
+
+    record_audit(
+        db,
+        user_id=current_user.id,
+        action="telegram.bot_connected",
+        resource_type="telegram_bot",
+        resource_id=str(bot_id or ""),
+        metadata={"bot_username": bot_username, "webhook_url": webhook_url},
+    )
+
+    start_link = f"https://t.me/{bot_username}?start={start_token}" if bot_username else None
+    return {
+        "ok": True,
+        "bot_username": bot_username,
+        "bot_id": bot_id,
+        "start_link": start_link,
+        "webhook_url": webhook_url,
+        "commands_response": commands_result,
+    }
+
+
+@router.post("/disconnect")
+def disconnect_telegram(
+    current_user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    bot = get_user_bot(db, current_user.id, active_only=False)
+    if not bot or not bot.bot_token:
+        return {"ok": True, "disconnected": False}
+
+    try:
+        bot_token = decrypt_value(bot.bot_token)
+    except Exception:  # noqa: BLE001
+        bot_token = None
+
+    if bot_token:
+        try:
+            httpx.post(
+                f"https://api.telegram.org/bot{bot_token}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=15,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("telegram_delete_webhook_failed")
+
+    bot.bot_token = None
+    bot.webhook_secret = None
+    bot.status = "disconnected"
+    bot.disconnected_at = datetime.now(timezone.utc)
+    db.add(bot)
+
+    db.query(TelegramLink).filter(TelegramLink.user_id == current_user.id).delete()
+
+    try:
+        from app.models.summary_schedule import SummarySchedule
+
+        schedules = db.execute(
+            select(SummarySchedule).where(SummarySchedule.user_id == current_user.id)
+        ).scalars().all()
+        for schedule in schedules:
+            schedule.active = False
+            db.add(schedule)
+    except Exception:  # noqa: BLE001
+        logger.exception("telegram_disconnect_schedule_disable_failed")
+
+    db.commit()
+
+    record_audit(
+        db,
+        user_id=current_user.id,
+        action="telegram.bot_disconnected",
+        resource_type="telegram_bot",
+        resource_id=str(bot.bot_id or ""),
+        metadata={"bot_username": bot.bot_username},
+    )
+
+    return {"ok": True, "disconnected": True}
+
+
 @router.post("/link-token")
 def create_link_token(
     current_user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    token = secrets.token_urlsafe(16)
-    redis_client = get_redis()
-    redis_client.setex(
-        f"telegram:link:{token}",
-        settings.telegram_link_ttl_seconds,
-        str(current_user.id),
-    )
-
-    link = None
-    bot_username = _get_bot_username(db)
-    if bot_username:
-        link = f"https://t.me/{bot_username}?start={token}"
-
-    return {"token": token, "link": link, "expires_in": settings.telegram_link_ttl_seconds}
+    bot = get_user_bot(db, current_user.id, active_only=True)
+    if not bot or not bot.bot_username or not bot.start_token:
+        raise HTTPException(status_code=400, detail="telegram bot not connected")
+    link = f"https://t.me/{bot.bot_username}?start={bot.start_token}"
+    return {"link": link}
 
 
 @router.get("/status")
@@ -516,12 +740,18 @@ def telegram_status(
     link = db.execute(
         select(TelegramLink).where(TelegramLink.user_id == current_user.id)
     ).scalar_one_or_none()
-    bot_username = _get_bot_username(db)
+    bot = get_user_bot(db, current_user.id, active_only=False)
+    bot_username = bot.bot_username if bot else _get_bot_username(db, current_user.id)
+    start_link = None
+    if bot and bot.bot_username and bot.start_token and bot.status == "active":
+        start_link = f"https://t.me/{bot.bot_username}?start={bot.start_token}"
     return {
         "connected": bool(link),
+        "bot_connected": bool(bot and bot.status == "active" and bot.bot_token),
         "bot_username": bot_username,
         "display_name": link.display_name if link else None,
         "telegram_user_id": link.telegram_user_id if link else None,
+        "start_link": start_link,
     }
 
 
@@ -532,13 +762,20 @@ def set_telegram_webhook(
 ):
     """Register this server's /telegram/webhook URL with Telegram so the
     bot starts receiving /start and other commands. Idempotent."""
-    bot_token = _get_bot_token(db)
-    if not bot_token:
-        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
-    if not settings.telegram_webhook_secret:
-        raise HTTPException(status_code=400, detail="telegram_webhook_secret not configured")
+    bot = get_user_bot(db, current_user.id, active_only=True)
+    if not bot or not bot.bot_token:
+        raise HTTPException(status_code=400, detail="telegram bot not connected")
+    try:
+        bot_token = decrypt_value(bot.bot_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bot_token invalid: {exc}")
     if not settings.public_base_url:
         raise HTTPException(status_code=400, detail="public_base_url not configured")
+
+    if not bot.webhook_secret:
+        bot.webhook_secret = secrets.token_urlsafe(24)
+        db.add(bot)
+        db.commit()
 
     webhook_url = settings.public_base_url.rstrip("/") + "/telegram/webhook"
     try:
@@ -546,7 +783,7 @@ def set_telegram_webhook(
             f"https://api.telegram.org/bot{bot_token}/setWebhook",
             json={
                 "url": webhook_url,
-                "secret_token": settings.telegram_webhook_secret,
+                "secret_token": bot.webhook_secret,
                 "drop_pending_updates": True,
                 "allowed_updates": ["message", "edited_message", "callback_query", "my_chat_member"],
             },
@@ -617,9 +854,13 @@ def set_telegram_commands(
 ):
     """Republish the slash-command menu in Telegram. Useful after editing
     the command list. Idempotent."""
-    bot_token = _get_bot_token(db)
-    if not bot_token:
-        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
+    bot = get_user_bot(db, current_user.id, active_only=True)
+    if not bot or not bot.bot_token:
+        raise HTTPException(status_code=400, detail="telegram bot not connected")
+    try:
+        bot_token = decrypt_value(bot.bot_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bot_token invalid: {exc}")
     try:
         result = _set_bot_commands(bot_token)
     except Exception as exc:  # pragma: no cover - network failure path
@@ -644,9 +885,13 @@ def telegram_webhook_info(
     db: Session = Depends(get_db),
 ):
     """Return Telegram's view of the currently registered webhook (for debugging)."""
-    bot_token = _get_bot_token(db)
-    if not bot_token:
-        raise HTTPException(status_code=400, detail="telegram_bot_token not configured")
+    bot = get_user_bot(db, current_user.id, active_only=True)
+    if not bot or not bot.bot_token:
+        raise HTTPException(status_code=400, detail="telegram bot not connected")
+    try:
+        bot_token = decrypt_value(bot.bot_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bot_token invalid: {exc}")
     try:
         resp = httpx.get(
             f"https://api.telegram.org/bot{bot_token}/getWebhookInfo",
@@ -663,15 +908,38 @@ def telegram_webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if not settings.telegram_webhook_secret:
-        logger.error("telegram_webhook_rejected", extra={"reason": "missing_secret"})
-        raise HTTPException(status_code=401, detail="Unauthorized")
     if not x_telegram_bot_api_secret_token:
         logger.warning("telegram_webhook_rejected", extra={"reason": "missing_header"})
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+
+    bot_token: str | None = None
+    bot_username: str | None = None
+    bot_user_id: int | None = None
+
+    bot = get_bot_by_webhook_secret(db, x_telegram_bot_api_secret_token)
+    if bot and bot.bot_token:
+        try:
+            bot_token = decrypt_value(bot.bot_token)
+        except Exception:  # noqa: BLE001
+            bot_token = None
+        bot_username = bot.bot_username
+        bot_user_id = bot.user_id
+    elif settings.telegram_webhook_secret and x_telegram_bot_api_secret_token == settings.telegram_webhook_secret:
+        bot_token = _get_bot_token(db)
+        bot_username = _get_bot_username(db)
+
+    if not bot_token:
         logger.warning("telegram_webhook_rejected", extra={"reason": "invalid_secret"})
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        db.info["telegram_bot_token"] = bot_token
+        if bot_username:
+            db.info["telegram_bot_username"] = bot_username
+        if bot_user_id is not None:
+            db.info["telegram_bot_user_id"] = bot_user_id
+    except Exception:  # noqa: BLE001
+        pass
 
     update_id = update.get("update_id")
     if isinstance(update_id, int):
@@ -708,11 +976,7 @@ def telegram_webhook(
                 and chat_kind in {"group", "supergroup"}
             )
             if became_member and adder_tg_id:
-                link = db.execute(
-                    select(TelegramLink).where(
-                        TelegramLink.telegram_user_id == adder_tg_id
-                    )
-                ).scalar_one_or_none()
+                link = _get_link(db, adder_tg_id)
                 if link and link.telegram_user_id:
                     dm_chat_id = str(link.telegram_user_id)
                     user_id_int = link.user_id
@@ -857,9 +1121,7 @@ def telegram_webhook(
 
         # ---- Agent delete callbacks (from unified ChatService picker) ----
         if data in {"delcancel", "runcancel"}:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             if not link:
                 if callback_id:
                     _answer_callback(db, callback_id, "Please link your account first")
@@ -881,9 +1143,7 @@ def telegram_webhook(
             return {"ok": True}
 
         if parts[0] == "runpick" and len(parts) >= 2:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -933,9 +1193,7 @@ def telegram_webhook(
 
         # ---- Resume / discard incomplete agent ---------------------------
         if parts[0] in {"agpause", "agtime"} and len(parts) >= 2:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -1052,9 +1310,7 @@ def telegram_webhook(
             return {"ok": True}
 
         if parts[0] == "agtset" and len(parts) >= 3:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -1147,9 +1403,7 @@ def telegram_webhook(
                 _answer_callback(db, callback_id, "Updated")
             return {"ok": True}
         if parts[0] in {"resume", "discard"} and len(parts) >= 2:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -1256,9 +1510,7 @@ def telegram_webhook(
 
         # ---- Telegram group picker (after agent create) ------------------
         if parts[0] == "groupcancel" and len(parts) >= 2:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             if not link:
                 if callback_id:
                     _answer_callback(db, callback_id, "Please link your account first")
@@ -1289,9 +1541,7 @@ def telegram_webhook(
             return {"ok": True}
 
         if parts[0] == "grouppick" and len(parts) >= 3:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -1394,9 +1644,7 @@ def telegram_webhook(
             return {"ok": True}
 
         if parts[0] in {"delpick", "delconfirm"} and len(parts) >= 2:
-            link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            link = _get_link(db, telegram_user_id)
             user_id = link.user_id if link else None
             if not user_id:
                 if callback_id:
@@ -1469,9 +1717,7 @@ def telegram_webhook(
 
         action = parts[1]
         request_id = parts[2]
-        link = db.execute(
-            select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-        ).scalar_one_or_none()
+        link = _get_link(db, telegram_user_id)
         user_id = link.user_id if link else None
         if not user_id:
             if callback_id:
@@ -1641,18 +1887,21 @@ def telegram_webhook(
         confirm_token = None
 
     linked_user_id: int | None = None
+    linked_from_start = False
     if start_token:
-        redis_client = get_redis()
-        user_id_value = redis_client.get(f"telegram:link:{start_token}")
-        if user_id_value:
-            linked_user_id = int(user_id_value)
-            redis_client.delete(f"telegram:link:{start_token}")
+        bot_for_start = db.execute(
+            select(TelegramBot).where(
+                TelegramBot.start_token == start_token,
+                TelegramBot.status == "active",
+            )
+        ).scalar_one_or_none()
+        bot_user_id = _get_bot_user_id(db)
+        if bot_for_start and (bot_user_id is None or bot_for_start.user_id == bot_user_id):
+            linked_user_id = bot_for_start.user_id
+            linked_from_start = True
 
-            existing_link = db.execute(
-                select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-            ).scalar_one_or_none()
+            existing_link = _get_link(db, telegram_user_id, user_id=linked_user_id)
             if existing_link:
-                existing_link.user_id = linked_user_id
                 existing_link.display_name = name
             else:
                 db.add(
@@ -1680,17 +1929,17 @@ def telegram_webhook(
         )
     db.commit()
 
-    link = db.execute(
-        select(TelegramLink).where(TelegramLink.telegram_user_id == telegram_user_id)
-    ).scalar_one_or_none()
+    link = _get_link(db, telegram_user_id)
     if link:
         linked_user_id = link.user_id
 
     if not linked_user_id:
         logger.warning("telegram_unlinked_block", extra={"chat_id": str(chat_id)})
-        if start_token:
+        if start_token and linked_from_start:
             _send_message(db, chat_id, "✅ Account linked.")
             _send_welcome(db, str(chat_id))
+        elif start_token:
+            _send_message(db, chat_id, "That link is invalid. Please reconnect in the dashboard.")
         else:
             _send_message(db, chat_id, "Please link your account first via the dashboard.")
         return {"ok": True}

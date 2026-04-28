@@ -27,6 +27,7 @@ from app.api.routes import (
 	workflows,
 )
 from app.core.config import settings
+from app.services.telegram_health import log_telegram_status_on_startup
 
 _is_prod = settings.environment in {"staging", "production"}
 app = FastAPI(
@@ -72,3 +73,8 @@ def _discover_plugins() -> None:
         from app.plugins import plugin_registry
 
         plugin_registry.discover()
+
+
+@app.on_event("startup")
+def _log_telegram_status() -> None:
+    log_telegram_status_on_startup()
