@@ -18,9 +18,24 @@ router = APIRouter()
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GMAIL_PROFILE_URL = "https://www.googleapis.com/gmail/v1/users/me/profile"
 CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
+from fastapi import status
+
+# --- Disconnect endpoint ---
+@router.delete("/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def google_disconnect(current_user: User = Depends(require_user), db: Session = Depends(get_db)):
+    account = db.execute(
+        select(GoogleAccount).where(GoogleAccount.user_id == current_user.id)
+    ).scalar_one_or_none()
+    if not account:
+        # Already disconnected
+        return
+    db.delete(account)
+    db.commit()
+    return
 
 
 def _require_google_config() -> None:
