@@ -4,7 +4,7 @@ from urllib.parse import urlencode
 import httpx
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,19 +22,27 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GMAIL_PROFILE_URL = "https://www.googleapis.com/gmail/v1/users/me/profile"
 CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
-from fastapi import status
 
-# --- Disconnect endpoint ---
-@router.delete("/disconnect", status_code=status.HTTP_204_NO_CONTENT)
-def google_disconnect(current_user: User = Depends(require_user), db: Session = Depends(get_db)):
+
+def _disconnect_google_account(db: Session, user_id: int) -> None:
     account = db.execute(
-        select(GoogleAccount).where(GoogleAccount.user_id == current_user.id)
+        select(GoogleAccount).where(GoogleAccount.user_id == user_id)
     ).scalar_one_or_none()
     if not account:
-        # Already disconnected
         return
     db.delete(account)
     db.commit()
+
+
+@router.delete("/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def google_disconnect(current_user: User = Depends(require_user), db: Session = Depends(get_db)):
+    _disconnect_google_account(db, current_user.id)
+    return
+
+
+@router.post("/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def google_disconnect_post(current_user: User = Depends(require_user), db: Session = Depends(get_db)):
+    _disconnect_google_account(db, current_user.id)
     return
 
 

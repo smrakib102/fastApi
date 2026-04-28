@@ -125,13 +125,16 @@
             disconnectGoogleBtn.disabled = true;
             disconnectGoogleBtn.textContent = "Disconnecting...";
             try {
-                const response = await fetch("/google/disconnect", { method: "DELETE" });
+                const response = await fetch("/google/disconnect", {
+                    method: "POST",
+                    credentials: "same-origin",
+                });
                 if (response.ok) {
                     window.location.reload();
                 } else {
                     disconnectGoogleBtn.disabled = false;
                     disconnectGoogleBtn.textContent = "Disconnect";
-                    alert("Failed to disconnect Google account.");
+                    alert(`Failed to disconnect Google account (status ${response.status}).`);
                 }
             } catch (e) {
                 disconnectGoogleBtn.disabled = false;
