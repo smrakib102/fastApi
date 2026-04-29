@@ -1,6 +1,7 @@
 from app.models.admin_setting import AdminSetting
 from app.models.audit_log import AuditLog
 from app.models.agent import Agent
+from app.models.agent_credential import AgentCredential
 from app.models.chat_message import ChatMessage
 from app.models.conversation import Conversation
 from app.models.agent_run import AgentRun
@@ -12,6 +13,7 @@ from app.models.approval import Approval
 from app.models.employee import Employee
 from app.models.google_account import GoogleAccount
 from app.models.model_performance import ModelPerformance
+from app.models.oauth_credential import OAuthCredential
 from app.models.reminder import Reminder
 from app.models.task import Task
 from app.models.telegram_link import TelegramLink
@@ -37,6 +39,7 @@ __all__ = [
 	"Agent",
 	"Approval",
 	"AdminSetting",
+	"AgentCredential",
 	"AgentRelation",
 	"AgentTemplate",
 	"AgentPerformance",
@@ -47,6 +50,7 @@ __all__ = [
 	"Employee",
 	"GoogleAccount",
 	"ModelPerformance",
+	"OAuthCredential",
 	"Reminder",
 	"Task",
 	"TelegramLink",
