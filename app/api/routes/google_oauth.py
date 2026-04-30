@@ -91,10 +91,10 @@ def _build_nextauth_signin_url(request_id: str, provider: str, callback_url: str
         raise HTTPException(status_code=500, detail="NextAuth base URL not configured")
 
     base_url = settings.nextauth_base_url.rstrip("/")
-    params = {"state": request_id}
+    params = {"request_id": request_id, "provider": provider}
     if callback_url:
         params["callbackUrl"] = callback_url
-    return f"{base_url}/api/auth/signin/{provider}?{urlencode(params)}"
+    return f"{base_url}/api/shadow/start?{urlencode(params)}"
 
 
 def _get_default_account(db: Session, user_id: int) -> GoogleAccount:

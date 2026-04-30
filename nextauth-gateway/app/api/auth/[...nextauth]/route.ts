@@ -43,7 +43,10 @@ const handler = NextAuth({
         }
 
         const rawState = (account as { state?: string }).state || "";
-        const state = rawState.trim();
+        let state = rawState.trim();
+        if (!state) {
+          state = cookies().get("shadow_oauth_request_id")?.value?.trim() || "";
+        }
         const stateRegex = getOAuthRequestIdRegex();
         if (!state || !stateRegex.test(state)) {
           console.warn(getOAuthErrorCode("invalid"));
