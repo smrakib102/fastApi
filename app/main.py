@@ -15,6 +15,7 @@ from app.api.routes import (
 	health,
 	insights,
 	metrics,
+	oauth_vault,
 	runs,
 	summaries,
 	telegram,
@@ -50,6 +51,7 @@ app.include_router(runs.router, prefix="/runs", tags=["runs"])
 app.include_router(telegram.router, prefix="/telegram", tags=["telegram"])
 app.include_router(templates.router, prefix="/templates", tags=["templates"])
 app.include_router(google_oauth.router, prefix="/google", tags=["google"])
+app.include_router(oauth_vault.router, prefix="/oauth", tags=["oauth"])
 app.include_router(gmail.router, prefix="/gmail", tags=["gmail"])
 app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 app.include_router(tools.router, prefix="/tools", tags=["tools"])

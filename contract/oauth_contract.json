@@ -1,0 +1,16 @@
+{
+  "oauth_request_id": {
+    "regex": "^[A-Za-z0-9_-]{20,128}$",
+    "min_length": 20,
+    "max_length": 128,
+    "error_codes": {
+      "invalid": "INVALID_OAUTH_STATE",
+      "unknown": "UNKNOWN_OAUTH_REQUEST_ID"
+    }
+  },
+  "metrics": {
+    "invalid_state_rejected": "invalid_state_rejected",
+    "unknown_oauth_request_id": "unknown_oauth_request_id"
+  },
+  "notes": "Single source of truth. Update this file first, then update FastAPI + NextAuth imports in the same change."
+}

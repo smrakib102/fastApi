@@ -14,6 +14,9 @@ from app.core.config import settings
 from app.core.redis_client import get_redis
 from app.models.google_account import GoogleAccount
 from app.models.user import User
+from app.services.oauth_audit import log_event
+from app.services.oauth_request_store import create_request
+from app.services.oauth_rollout import get_route_decision
 
 router = APIRouter()
 
@@ -58,6 +61,40 @@ def _build_scopes() -> str:
     if not scope_list:
         return "openid email profile"
     return " ".join(scope_list)
+
+
+def _build_legacy_oauth_url(user_id: int) -> str:
+    _require_google_config()
+
+    state_token = secrets.token_urlsafe(32)
+    redis_client = get_redis()
+    redis_client.setex(
+        f"oauth:state:{state_token}",
+        settings.google_oauth_state_ttl_seconds,
+        str(user_id),
+    )
+
+    params = {
+        "client_id": settings.google_oauth_client_id,
+        "redirect_uri": settings.google_oauth_redirect_uri,
+        "response_type": "code",
+        "access_type": "offline",
+        "prompt": "consent",
+        "scope": _build_scopes(),
+        "state": state_token,
+    }
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+def _build_nextauth_signin_url(request_id: str, provider: str, callback_url: str | None) -> str:
+    if not settings.nextauth_base_url:
+        raise HTTPException(status_code=500, detail="NextAuth base URL not configured")
+
+    base_url = settings.nextauth_base_url.rstrip("/")
+    params = {"state": request_id}
+    if callback_url:
+        params["callbackUrl"] = callback_url
+    return f"{base_url}/api/auth/signin/{provider}?{urlencode(params)}"
 
 
 def _get_default_account(db: Session, user_id: int) -> GoogleAccount:
@@ -106,26 +143,63 @@ def _ensure_token(db: Session, account: GoogleAccount) -> GoogleAccount:
 
 @router.get("/oauth/start")
 def google_oauth_start(current_user: User = Depends(require_user)):
-    _require_google_config()
+    return {"url": _build_legacy_oauth_url(current_user.id)}
 
-    state_token = secrets.token_urlsafe(32)
-    redis_client = get_redis()
-    redis_client.setex(
-        f"oauth:state:{state_token}",
-        settings.google_oauth_state_ttl_seconds,
-        str(current_user.id),
+
+@router.get("/oauth/shadow/start")
+def google_oauth_shadow_start(
+    current_user: User = Depends(require_user),
+    agent_id: int | None = Query(default=None),
+    tool_names: str | None = Query(default=None),
+):
+    if not settings.enable_nextauth_oauth:
+        return {"url": _build_legacy_oauth_url(current_user.id), "mode": "legacy"}
+
+    decision = get_route_decision(current_user.id)
+    if decision.mode != "nextauth":
+        log_event(
+            "shadow_oauth_start",
+            user_id=current_user.id,
+            request_id=None,
+            provider="google",
+            agent_id=agent_id,
+            mode="legacy",
+            bucket=decision.bucket,
+            routing_source=decision.source,
+            cached=decision.cached,
+        )
+        return {"url": _build_legacy_oauth_url(current_user.id), "mode": "legacy"}
+
+    scopes = [scope for scope in _build_scopes().split(" ") if scope]
+    tools_list = [item.strip() for item in (tool_names or "").split(",") if item.strip()]
+    request_id = create_request(
+        user_id=current_user.id,
+        agent_id=agent_id,
+        tool_names=tools_list,
+        required_scopes=scopes,
+        route_mode=decision.mode,
+        route_bucket=decision.bucket,
+        routing_source=decision.source,
+        provider="google",
     )
 
-    params = {
-        "client_id": settings.google_oauth_client_id,
-        "redirect_uri": settings.google_oauth_redirect_uri,
-        "response_type": "code",
-        "access_type": "offline",
-        "prompt": "consent",
-        "scope": _build_scopes(),
-        "state": state_token,
-    }
-    return {"url": f"{GOOGLE_AUTH_URL}?{urlencode(params)}"}
+    callback_url = settings.nextauth_post_auth_redirect_url
+    if not callback_url and settings.public_base_url:
+        callback_url = f"{settings.public_base_url.rstrip('/')}/tools"
+
+    url = _build_nextauth_signin_url(request_id, "google", callback_url)
+    log_event(
+        "shadow_oauth_start",
+        user_id=current_user.id,
+        request_id=request_id,
+        provider="google",
+        agent_id=agent_id,
+        mode="nextauth",
+        bucket=decision.bucket,
+        routing_source=decision.source,
+        cached=decision.cached,
+    )
+    return {"url": url, "mode": "nextauth", "request_id": request_id}
 
 
 # Phase 8: bridge endpoint that lets Telegram users (who have no web

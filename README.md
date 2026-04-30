@@ -51,3 +51,18 @@ Set `TOOL_API_TOKEN` in `.env` and update the header in `openclaw-tools.json`.
 
 - `GET /health`
 - `GET /agents`
+
+## Phase 2 Shadow OAuth (Production Operations)
+
+See [docs/PHASE2_SHADOW_OAUTH_RUNBOOK.md](docs/PHASE2_SHADOW_OAUTH_RUNBOOK.md).
+
+This document contains production runbooks for OAuth rotation, incident response, migration steps, and monitoring guidelines for the Shadow OAuth system.
+
+### Quick Ops Actions
+
+- Disable shadow OAuth: `ENABLE_NEXTAUTH_OAUTH=false`
+- Enable fallback mode: `ENABLE_VAULT_SYSTEM=false`
+- Check system health: `/metrics/oauth`
+- View incident state: logs + oauth_metrics dashboard
+
+Warning: All OAuth production changes must follow the Phase 2 runbook before deployment.

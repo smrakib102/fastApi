@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -25,6 +26,28 @@ class Settings(BaseSettings):
     telegram_link_ttl_seconds: int = 600
     telegram_prompt_ttl_seconds: int = 600
     google_oauth_state_ttl_seconds: int = 600
+    # Phase 2: NextAuth shadow OAuth (write-only vault)
+    enable_nextauth_oauth: bool = False
+    enable_vault_system: bool = False
+    nextauth_base_url: str | None = None
+    nextauth_post_auth_redirect_url: str | None = None
+    nextauth_callback_secret: str | None = None
+    nextauth_signature_secret: str | None = None
+    nextauth_signature_secondary_secret: str | None = None
+    oauth_rollout_percent: int = 0
+    oauth_rollout_mode: str = "hash"
+    oauth_allowlist_user_ids: str | None = None
+    oauth_request_ttl_seconds: int = Field(default=900, validation_alias="OAUTH_REQUEST_TTL_SEC")
+    oauth_processed_ttl_seconds: int = 900
+    oauth_processing_lock_seconds: int = 60
+    oauth_route_ttl_seconds: int = 86400
+    oauth_callback_max_skew_seconds: int = 300
+    oauth_callback_drift_log_seconds: int = 60
+    oauth_metrics_window_seconds: int = 300
+    oauth_callback_failure_threshold: int = 25
+    oauth_vault_failure_threshold: int = 10
+    oauth_duplicate_threshold: int = 50
+    oauth_kill_switch_ttl_seconds: int = 3600
     admin_otp_ttl_seconds: int = 600
     admin_otp_rate_seconds: int = 60
     admin_otp_max_attempts: int = 5
@@ -172,6 +195,13 @@ def _validate_settings(config: Settings) -> None:
             raise RuntimeError("tool_api_token is required in staging/production")
         if config.auth_secret_key == "change-me":
             raise RuntimeError("auth_secret_key must be set in staging/production")
+        if config.enable_nextauth_oauth or config.enable_vault_system:
+            if not config.nextauth_base_url:
+                raise RuntimeError("nextauth_base_url is required when NextAuth OAuth is enabled")
+            if not config.nextauth_callback_secret:
+                raise RuntimeError("nextauth_callback_secret is required when NextAuth OAuth is enabled")
+            if not config.nextauth_signature_secret:
+                raise RuntimeError("nextauth_signature_secret is required when NextAuth OAuth is enabled")
 
     # S4: Prevent split-memory. If the master unified-chat flag is on but
     # the Telegram sub-flag was forgotten, force it on so both surfaces

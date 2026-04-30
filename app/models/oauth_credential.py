@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 from sqlalchemy.sql import func
 
 from app.db.base import Base
@@ -17,6 +17,9 @@ class OAuthCredential(Base):
     token_type = Column(String(32), nullable=True)
     scope = Column(Text, nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
+    invalid_state = Column(Boolean, nullable=False, default=False)
+    invalid_reason = Column(Text, nullable=True)
+    invalid_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
