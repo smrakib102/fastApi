@@ -7,7 +7,7 @@ import {
   getOAuthErrorCode,
   getOAuthMetric,
   getOAuthRequestIdRegex
-} from "@/lib/oauthContract";
+} from "../../../../lib/oauthContract";
 
 const handler = NextAuth({
   providers: [
