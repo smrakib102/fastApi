@@ -2,8 +2,22 @@ import { NextResponse } from "next/server";
 
 const SHADOW_STATE_COOKIE = "shadow_oauth_request_id";
 
+function getPublicBaseUrl(request: Request): string {
+  const envUrl = (process.env.NEXTAUTH_URL || "").trim();
+  if (envUrl) {
+    return envUrl.replace(/\/$/, "");
+  }
+  const proto = request.headers.get("x-forwarded-proto") || "https";
+  const host = request.headers.get("x-forwarded-host") || request.headers.get("host") || "";
+  if (!host) {
+    return "";
+  }
+  return `${proto}://${host}`.replace(/\/$/, "");
+}
+
 export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
+  const requestUrl = new URL(request.url);
+  const { searchParams } = requestUrl;
   const requestId = (searchParams.get("request_id") || "").trim();
   const provider = (searchParams.get("provider") || "google").trim();
   const callbackUrl = (searchParams.get("callbackUrl") || "").trim();
@@ -12,7 +26,8 @@ export async function GET(request: Request) {
     return new Response("missing_request_id", { status: 400 });
   }
 
-  const target = new URL(`/api/auth/signin/${provider}`, request.url);
+  const baseUrl = getPublicBaseUrl(request) || requestUrl.origin;
+  const target = new URL(`/api/auth/signin/${provider}`, baseUrl);
   if (callbackUrl) {
     target.searchParams.set("callbackUrl", callbackUrl);
   }
