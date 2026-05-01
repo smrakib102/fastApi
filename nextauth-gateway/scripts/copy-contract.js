@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const repoRoot = path.resolve(__dirname, "..", "..", "..");
-const source = path.join(repoRoot, "contract", "oauth_contract.json");
+const source = path.join(repoRoot, "ai-agent-system", "contract", "oauth_contract.json");
 const targets = [
   path.join(__dirname, "..", ".next", "contract", "oauth_contract.json"),
   path.join(__dirname, "..", ".next", "standalone", ".next", "contract", "oauth_contract.json")
