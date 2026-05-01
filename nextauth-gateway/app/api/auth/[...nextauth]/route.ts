@@ -25,8 +25,10 @@ const handler = NextAuth({
             "https://www.googleapis.com/auth/calendar.readonly",
             "https://www.googleapis.com/auth/calendar.events"
           ].join(" "),
+          response_type: "code",
           access_type: "offline",
-          prompt: "consent"
+          prompt: "consent",
+          include_granted_scopes: "true"
         }
       }
     }),
@@ -46,7 +48,11 @@ const handler = NextAuth({
       }
       console.warn("shadow_signin_entry", {
         provider: account.provider,
-        has_account_state: Boolean((account as { state?: string }).state)
+        has_account_state: Boolean((account as { state?: string }).state),
+        has_refresh_token: Boolean((account as { refresh_token?: string }).refresh_token),
+        has_access_token: Boolean(account.access_token),
+        token_type: account.token_type || null,
+        scope: account.scope || null
       });
       try {
         const callbackUrl = cookies().get("next-auth.callback-url")?.value;
