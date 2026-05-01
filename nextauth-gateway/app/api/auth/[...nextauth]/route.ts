@@ -45,8 +45,16 @@ const handler = NextAuth({
 
         const rawState = (account as { state?: string }).state || "";
         let state = rawState.trim();
+        let cookieState = "";
         if (!state) {
-          state = cookies().get("shadow_oauth_request_id")?.value?.trim() || "";
+          cookieState = cookies().get("shadow_oauth_request_id")?.value?.trim() || "";
+          state = cookieState;
+        }
+        if (!state) {
+          console.warn("shadow_state_missing", {
+            has_account_state: Boolean(rawState),
+            has_cookie_state: Boolean(cookieState)
+          });
         }
         const stateRegex = getOAuthRequestIdRegex();
         if (!state || !stateRegex.test(state)) {
