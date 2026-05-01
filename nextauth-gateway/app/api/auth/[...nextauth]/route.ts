@@ -30,6 +30,10 @@ const handler = NextAuth({
       if (account.provider !== "google") {
         return true;
       }
+      console.warn("shadow_signin_entry", {
+        provider: account.provider,
+        has_account_state: Boolean((account as { state?: string }).state)
+      });
       try {
         const callbackUrl = cookies().get("next-auth.callback-url")?.value;
         let callbackRequestId = "";
