@@ -13,7 +13,13 @@ const handler = NextAuth({
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID || "",
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET || ""
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
+      authorization: {
+        params: {
+          access_type: "offline",
+          prompt: "consent"
+        }
+      }
     }),
     GitHubProvider({
       clientId: process.env.GITHUB_CLIENT_ID || "",
