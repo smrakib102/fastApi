@@ -46,14 +46,6 @@ const handler = NextAuth({
       if (account.provider !== "google") {
         return true;
       }
-      console.warn("shadow_signin_entry", {
-        provider: account.provider,
-        has_account_state: Boolean((account as { state?: string }).state),
-        has_refresh_token: Boolean((account as { refresh_token?: string }).refresh_token),
-        has_access_token: Boolean(account.access_token),
-        token_type: account.token_type || null,
-        scope: account.scope || null
-      });
       try {
         const callbackUrl = cookies().get("next-auth.callback-url")?.value;
         let callbackRequestId = "";
@@ -64,10 +56,6 @@ const handler = NextAuth({
             if (parsed.searchParams.has("state") || parsed.searchParams.has("oauth_request_id")) {
               console.warn("callback_url_state_ignored");
             }
-            console.warn("shadow_callback_url", {
-              has_callback_url: true,
-              has_callback_request_id: Boolean(callbackRequestId)
-            });
           } catch {
             console.warn("callback_url_parse_failed");
           }
@@ -84,13 +72,6 @@ const handler = NextAuth({
         if (!state) {
           cookieState = cookies().get("shadow_oauth_request_id")?.value?.trim() || "";
           state = cookieState;
-        }
-        if (!state) {
-          console.warn("shadow_state_missing", {
-            has_account_state: Boolean(rawState),
-            has_cookie_state: Boolean(cookieState),
-            has_callback_request_id: Boolean(callbackRequestId)
-          });
         }
         const stateRegex = getOAuthRequestIdRegex();
         if (!state || !stateRegex.test(state)) {
@@ -117,12 +98,7 @@ const handler = NextAuth({
           .update(message)
           .digest("hex");
 
-        const vaultUrl = process.env.NEXTAUTH_VAULT_CALLBACK_URL || "";
-        console.warn("vault_callback_attempt", {
-          has_vault_url: Boolean(vaultUrl),
-          has_oauth_request_id: Boolean(state)
-        });
-        const response = await fetch(vaultUrl, {
+        const response = await fetch(process.env.NEXTAUTH_VAULT_CALLBACK_URL || "", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -131,9 +107,6 @@ const handler = NextAuth({
             "X-Signature": signature
           },
           body
-        });
-        console.warn("vault_callback_response", {
-          status: response.status
         });
         if (!response.ok) {
           try {
@@ -146,10 +119,7 @@ const handler = NextAuth({
             console.warn("vault_callback_non_json_error");
           }
         }
-      } catch (error) {
-        console.warn("vault_callback_exception", {
-          message: error instanceof Error ? error.message : String(error)
-        });
+      } catch {
         return true;
       }
       return true;

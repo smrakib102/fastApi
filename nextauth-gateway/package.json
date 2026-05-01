@@ -4,6 +4,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "postbuild": "node scripts/copy-contract.js",
     "start": "next start",
     "lint": "next lint"
   },
