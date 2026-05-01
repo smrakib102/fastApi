@@ -27,7 +27,7 @@ export async function GET(request: Request) {
   }
 
   const baseUrl = getPublicBaseUrl(request) || requestUrl.origin;
-  const target = new URL(`/api/auth/signin/${provider}`, baseUrl);
+  const target = new URL("/api/auth/signin", baseUrl);
   if (callbackUrl) {
     target.searchParams.set("callbackUrl", callbackUrl);
   }
