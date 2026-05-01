@@ -13,8 +13,7 @@ const handler = NextAuth({
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID || "",
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
-      checks: ["pkce"]
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || ""
     }),
     GitHubProvider({
       clientId: process.env.GITHUB_CLIENT_ID || "",
