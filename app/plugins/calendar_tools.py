@@ -25,7 +25,7 @@ def _wrap(handler):
 def _list(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _calendar_list
 
-    return _calendar_list(ctx.db, ctx.user_id)
+    return _calendar_list(ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _create_request(args: dict, ctx: ToolContext) -> dict:
@@ -37,13 +37,13 @@ def _create_request(args: dict, ctx: ToolContext) -> dict:
 def _create(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _calendar_create
 
-    return _calendar_create(args, ctx.db, ctx.user_id)
+    return _calendar_create(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _list_events(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _calendar_list_events
 
-    return _calendar_list_events(args, ctx.db, ctx.user_id)
+    return _calendar_list_events(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _update_request(args: dict, ctx: ToolContext) -> dict:

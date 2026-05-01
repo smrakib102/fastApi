@@ -131,10 +131,22 @@ def ensure_agent_credential(
     agent_id: int | None,
     credential_id: int,
     required_scopes: list[str] | None,
-) -> AgentCredential | None:
+) -> tuple[AgentCredential | None, bool, bool]:
     if agent_id is None:
-        return None
+        return None, False, False
     scopes_text = " ".join(required_scopes or []) or None
+    existing = (
+        db.query(AgentCredential)
+        .filter(
+            AgentCredential.agent_id == agent_id,
+            AgentCredential.credential_id == credential_id,
+        )
+        .one_or_none()
+    )
+    created = existing is None
+    updated = False
+    if existing and existing.required_scopes != scopes_text:
+        updated = True
     stmt = (
         insert(AgentCredential)
         .values(
@@ -142,20 +154,12 @@ def ensure_agent_credential(
             credential_id=credential_id,
             required_scopes=scopes_text,
         )
-        .on_conflict_do_nothing(
+        .on_conflict_do_update(
             index_elements=["agent_id", "credential_id"],
+            set_={"required_scopes": scopes_text},
         )
         .returning(AgentCredential.id)
     )
     result = db.execute(stmt)
-    agent_credential_id = result.scalar_one_or_none()
-    if agent_credential_id is None:
-        return (
-            db.query(AgentCredential)
-            .filter(
-                AgentCredential.agent_id == agent_id,
-                AgentCredential.credential_id == credential_id,
-            )
-            .one_or_none()
-        )
-    return db.get(AgentCredential, agent_credential_id)
+    agent_credential_id = result.scalar_one()
+    return db.get(AgentCredential, agent_credential_id), created, updated

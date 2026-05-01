@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # Phase 2: NextAuth shadow OAuth (write-only vault)
     enable_nextauth_oauth: bool = False
     enable_vault_system: bool = False
+    enable_agent_credential_linking: bool = False
     nextauth_base_url: str | None = None
     nextauth_post_auth_redirect_url: str | None = None
     nextauth_callback_secret: str | None = None
@@ -48,6 +49,10 @@ class Settings(BaseSettings):
     oauth_vault_failure_threshold: int = 10
     oauth_duplicate_threshold: int = 50
     oauth_kill_switch_ttl_seconds: int = 3600
+    vault_execution_enabled: bool = False
+    legacy_fallback_enabled: bool = True
+    vault_scope_enforcement_enabled: bool = False
+    vault_refresh_enabled: bool = False
     admin_otp_ttl_seconds: int = 600
     admin_otp_rate_seconds: int = 60
     admin_otp_max_attempts: int = 5

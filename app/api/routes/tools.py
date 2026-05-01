@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.api.routes.google_oauth import _ensure_token, _get_default_account
 from app.core.config import settings
 from app.models.approval import Approval
 from app.services.usage_limits import check_and_record_usage
@@ -37,6 +36,7 @@ GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 class ToolExecuteRequest(BaseModel):
     name: str
     arguments: dict = {}
+    auth_context: dict | None = None
 
 
 def _require_tool_token(x_tool_token: str | None) -> None:
@@ -47,7 +47,12 @@ def _require_tool_token(x_tool_token: str | None) -> None:
 
 
 def _canonical_payload(payload: ToolExecuteRequest) -> str:
-    return json.dumps(payload.model_dump(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(
+        payload.model_dump(exclude_none=True),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
 
 
 def _validate_internal_signature(
@@ -136,6 +141,8 @@ def _execute_tool_internal(
         {"agent_id": internal_agent_id},
     )
 
+    auth_context = payload.auth_context or {}
+
     # Phase 5: consult the plugin registry FIRST when enabled. Plugins
     # take precedence over the legacy if/elif chain so the codebase can
     # migrate tools incrementally without a flag flip per tool.
@@ -151,6 +158,7 @@ def _execute_tool_internal(
                     db=db,
                     user_id=int(internal_user_id),
                     agent_id=internal_agent_id,
+                    extras={"auth_context": auth_context},
                 )
                 try:
                     return plugin.handler(payload.arguments, ctx)
@@ -163,27 +171,27 @@ def _execute_tool_internal(
             raise HTTPException(status_code=500, detail="Plugin dispatch failed") from exc
 
     if payload.name == "gmail.draft":
-        return _gmail_draft(payload.arguments, db, internal_user_id)
+        return _gmail_draft(payload.arguments, db, internal_user_id, auth_context)
     if payload.name == "gmail.send_request":
         return _gmail_send_request(payload.arguments, db, internal_user_id, internal_agent_id)
     if payload.name == "gmail.send":
-        return _gmail_send(payload.arguments, db, internal_user_id)
+        return _gmail_send(payload.arguments, db, internal_user_id, auth_context)
     if payload.name == "gmail.profile":
-        return _gmail_profile(db, internal_user_id)
+        return _gmail_profile(db, internal_user_id, auth_context)
     if payload.name == "calendar.list":
-        return _calendar_list(db, internal_user_id)
+        return _calendar_list(db, internal_user_id, auth_context)
     if payload.name == "calendar.list_events":
-        return _calendar_list_events(payload.arguments, db, internal_user_id)
+        return _calendar_list_events(payload.arguments, db, internal_user_id, auth_context)
     if payload.name == "calendar.create":
-        return _calendar_create(payload.arguments, db, internal_user_id)
+        return _calendar_create(payload.arguments, db, internal_user_id, auth_context)
     if payload.name == "calendar.create_request":
         return _calendar_create_request(payload.arguments, db, internal_user_id, internal_agent_id)
     if payload.name == "calendar.update_request":
         return _calendar_update_request(payload.arguments, db, internal_user_id, internal_agent_id)
     if payload.name == "gmail.list_messages":
-        return _gmail_list_messages(payload.arguments, db, internal_user_id)
+        return _gmail_list_messages(payload.arguments, db, internal_user_id, auth_context)
     if payload.name == "gmail.list_drafts":
-        return _gmail_list_drafts(payload.arguments, db, internal_user_id)
+        return _gmail_list_drafts(payload.arguments, db, internal_user_id, auth_context)
 
     raise HTTPException(status_code=404, detail="Unknown tool")
 
@@ -197,7 +205,14 @@ def _build_raw_message(to: str, subject: str, body: str) -> str:
     return base64.urlsafe_b64encode(raw_bytes).decode("utf-8")
 
 
-def _gmail_draft(args: dict, db: Session, user_id: int) -> dict:
+def _require_auth_token(auth_context: dict) -> str:
+    token = auth_context.get("access_token") if auth_context else None
+    if not token:
+        raise HTTPException(status_code=401, detail="AUTH_CONTEXT_REQUIRED_FOR_EXECUTION")
+    return token
+
+
+def _gmail_draft(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     to = args.get("to")
     subject = args.get("subject")
     body = args.get("body")
@@ -206,8 +221,8 @@ def _gmail_draft(args: dict, db: Session, user_id: int) -> dict:
     if not to or not subject or not body:
         raise HTTPException(status_code=400, detail="Missing to/subject/body")
 
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
 
     payload: dict = {"message": {"raw": _build_raw_message(to, subject, body)}}
     if thread_id:
@@ -239,13 +254,13 @@ def _gmail_send_request(args: dict, db: Session, user_id: int, agent_id: int | N
     return {"approval_id": approval.id, "status": approval.status}
 
 
-def _gmail_send(args: dict, db: Session, user_id: int) -> dict:
+def _gmail_send(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     draft_id = args.get("draft_id")
     if not draft_id:
         raise HTTPException(status_code=400, detail="Missing draft_id")
 
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     response = httpx.post(GMAIL_SEND_URL, headers=headers, json={"id": draft_id}, timeout=30)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to send draft")
@@ -253,25 +268,25 @@ def _gmail_send(args: dict, db: Session, user_id: int) -> dict:
     return response.json()
 
 
-def _gmail_profile(db: Session, user_id: int) -> dict:
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+def _gmail_profile(db: Session, user_id: int, auth_context: dict) -> dict:
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     response = httpx.get(GMAIL_PROFILE_URL, headers=headers, timeout=30)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch Gmail profile")
     return response.json()
 
 
-def _calendar_list(db: Session, user_id: int) -> dict:
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+def _calendar_list(db: Session, user_id: int, auth_context: dict) -> dict:
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     response = httpx.get(CALENDAR_LIST_URL, headers=headers, timeout=30)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch calendar list")
     return response.json()
 
 
-def _calendar_list_events(args: dict, db: Session, user_id: int) -> dict:
+def _calendar_list_events(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     calendar_id = args.get("calendar_id") or "primary"
     time_min = args.get("time_min")
     time_max = args.get("time_max")
@@ -286,8 +301,8 @@ def _calendar_list_events(args: dict, db: Session, user_id: int) -> dict:
     single_events = args.get("single_events", True)
     order_by = args.get("order_by", "startTime")
 
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     params = {
         "timeMin": time_min,
         "timeMax": time_max,
@@ -309,11 +324,11 @@ def _calendar_list_events(args: dict, db: Session, user_id: int) -> dict:
     return response.json()
 
 
-def _gmail_list_messages(args: dict, db: Session, user_id: int) -> dict:
+def _gmail_list_messages(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     max_results = args.get("max_results", 10)
     query = args.get("q")
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     params: dict = {"maxResults": max_results}
     if query:
         params["q"] = query
@@ -363,10 +378,10 @@ def _gmail_list_messages(args: dict, db: Session, user_id: int) -> dict:
     }
 
 
-def _gmail_list_drafts(args: dict, db: Session, user_id: int) -> dict:
+def _gmail_list_drafts(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     max_results = args.get("max_results", 10)
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     params = {"maxResults": max_results}
     response = httpx.get(GMAIL_DRAFT_URL, headers=headers, params=params, timeout=30)
     if response.status_code != 200:
@@ -420,7 +435,7 @@ def _calendar_auto_approve(user_id: int) -> bool:
     return int(user_id) in allowed
 
 
-def _calendar_create(args: dict, db: Session, user_id: int) -> dict:
+def _calendar_create(args: dict, db: Session, user_id: int, auth_context: dict) -> dict:
     calendar_id = args.get("calendar_id") or "primary"
     summary = args.get("summary")
     start = args.get("start")
@@ -428,8 +443,8 @@ def _calendar_create(args: dict, db: Session, user_id: int) -> dict:
     if not summary or not start or not end:
         raise HTTPException(status_code=400, detail="Missing calendar fields")
 
-    account = _ensure_token(db, _get_default_account(db, user_id))
-    headers = {"Authorization": f"Bearer {account.access_token}"}
+    access_token = _require_auth_token(auth_context)
+    headers = {"Authorization": f"Bearer {access_token}"}
     body = {
         "summary": summary,
         "description": args.get("description"),

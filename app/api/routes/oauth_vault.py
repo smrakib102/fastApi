@@ -1,4 +1,5 @@
 from typing import Any
+import logging
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.core.config import settings
 from app.services.audit_log import record_audit
+from app.models.agent import Agent
 from app.models.user import User
 from app.services.oauth_audit import log_event
 from app.services.oauth_contract import get_oauth_error_code, get_oauth_request_id_regex
@@ -36,6 +38,19 @@ from app.services.oauth_vault import (
     upsert_oauth_credential,
 )
 from app.services.permission_service import permission_service
+
+_logger = logging.getLogger("oauth_callback")
+_logger.setLevel(logging.INFO)
+if not _logger.handlers:
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    file_handler = logging.FileHandler("/app/uvicorn.log")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    _logger.addHandler(stream_handler)
+    _logger.addHandler(file_handler)
+    _logger.propagate = False
 
 router = APIRouter()
 
@@ -78,15 +93,30 @@ def _validate_signature(
     if not settings.nextauth_signature_secret:
         raise HTTPException(status_code=500, detail="NextAuth signature secret is not configured")
     if not timestamp_raw or not signature_raw:
+        log_event("signature_failed", request_id=request_id, reason="missing_headers")
+        _logger.error(
+            "oauth_callback_signature_failed",
+            extra={"event": "signature_failed", "request_id": request_id, "reason": "missing_headers"},
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing signature headers")
     try:
         timestamp = int(timestamp_raw)
     except ValueError as exc:
+        log_event("signature_failed", request_id=request_id, reason="invalid_timestamp")
+        _logger.error(
+            "oauth_callback_signature_failed",
+            extra={"event": "signature_failed", "request_id": request_id, "reason": "invalid_timestamp"},
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid timestamp") from exc
 
     now = int(time.time())
     drift = abs(now - timestamp)
     if drift > settings.oauth_callback_max_skew_seconds:
+        log_event("signature_failed", request_id=request_id, reason="timestamp_expired")
+        _logger.error(
+            "oauth_callback_signature_failed",
+            extra={"event": "signature_failed", "request_id": request_id, "reason": "timestamp_expired"},
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Signature timestamp expired")
     if drift > settings.oauth_callback_drift_log_seconds:
         log_event(
@@ -116,7 +146,75 @@ def _validate_signature(
             log_event("callback_signature_secondary", request_id=request_id)
             return
 
+    log_event("signature_failed", request_id=request_id, reason="invalid_signature")
+    _logger.error(
+        "oauth_callback_signature_failed",
+        extra={"event": "signature_failed", "request_id": request_id, "reason": "invalid_signature"},
+    )
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+
+
+def _validate_agent_link(
+    db: Session,
+    *,
+    agent_id: int | None,
+    user_id: int,
+    request_id: str,
+) -> int | None:
+    if agent_id is None:
+        return None
+    agent = db.get(Agent, agent_id)
+    if not agent:
+        log_event(
+            "agent_link_skipped",
+            request_id=request_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            reason="agent_missing",
+        )
+        return None
+    if agent.user_id != user_id:
+        log_event(
+            "agent_link_skipped",
+            request_id=request_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            reason="agent_mismatch",
+        )
+        return None
+    return agent_id
+
+
+def _validate_agent_metadata(
+    *,
+    tool_names: Any,
+    required_scopes: Any,
+    request_id: str,
+    user_id: int,
+) -> tuple[list[str], list[str]]:
+    if tool_names is None:
+        tool_names = []
+    if required_scopes is None:
+        required_scopes = []
+    if not isinstance(tool_names, list) or not all(isinstance(t, str) for t in tool_names):
+        log_event(
+            "agent_link_skipped",
+            request_id=request_id,
+            user_id=user_id,
+            reason="tool_names_invalid",
+        )
+        return [], []
+    if not isinstance(required_scopes, list) or not all(
+        isinstance(s, str) for s in required_scopes
+    ):
+        log_event(
+            "agent_link_skipped",
+            request_id=request_id,
+            user_id=user_id,
+            reason="required_scopes_invalid",
+        )
+        return tool_names, []
+    return tool_names, required_scopes
 
 
 @router.post("/callback")
@@ -130,6 +228,11 @@ async def oauth_vault_callback(
 ):
     start_time = time.monotonic()
     try:
+        log_event("oauth_callback_received", request_id=payload.oauth_request_id)
+        _logger.info(
+            "oauth_callback_received",
+            extra={"event": "oauth_callback_received", "request_id": payload.oauth_request_id},
+        )
         if not settings.enable_vault_system:
             raise HTTPException(status_code=403, detail="Vault system is disabled")
         if not settings.nextauth_callback_secret:
@@ -141,6 +244,12 @@ async def oauth_vault_callback(
         _validate_signature(raw_body, x_timestamp, x_signature, payload.oauth_request_id)
         _validate_oauth_request_id(payload.oauth_request_id)
         _validate_provider_account_id(payload.provider_account_id)
+
+        log_event("oauth_callback_validated", request_id=payload.oauth_request_id)
+        _logger.info(
+            "oauth_callback_validated",
+            extra={"event": "oauth_callback_validated", "request_id": payload.oauth_request_id},
+        )
 
         if payload.provider != "google":
             record_anomaly("callback_provider_mismatch")
@@ -200,15 +309,102 @@ async def oauth_vault_callback(
                     invalid_at=invalid_at,
                 )
 
-                agent_credential = ensure_agent_credential(
-                    db,
-                    agent_id=request_payload.get("agent_id"),
+                log_event(
+                    "vault_upsert_success",
+                    request_id=payload.oauth_request_id,
                     credential_id=credential.id,
-                    required_scopes=request_payload.get("required_scopes"),
+                    created=created,
                 )
+                _logger.info(
+                    "vault_upsert_success",
+                    extra={
+                        "event": "vault_upsert_success",
+                        "request_id": payload.oauth_request_id,
+                        "credential_id": credential.id,
+                        "created_flag": created,
+                    },
+                )
+
+                agent_credential = None
+                agent_link_created = False
+                agent_link_updated = False
+                if settings.enable_agent_credential_linking:
+                    user_id = int(request_payload["user_id"])
+                    agent_id = _validate_agent_link(
+                        db,
+                        agent_id=request_payload.get("agent_id"),
+                        user_id=user_id,
+                        request_id=payload.oauth_request_id,
+                    )
+                    tool_names, required_scopes = _validate_agent_metadata(
+                        tool_names=request_payload.get("tool_names"),
+                        required_scopes=request_payload.get("required_scopes"),
+                        request_id=payload.oauth_request_id,
+                        user_id=user_id,
+                    )
+                    if agent_id is not None:
+                        agent_credential, agent_link_created, agent_link_updated = (
+                            ensure_agent_credential(
+                                db,
+                                agent_id=agent_id,
+                                credential_id=credential.id,
+                                required_scopes=required_scopes,
+                            )
+                        )
+                        if agent_link_created:
+                            log_event(
+                                "link_created",
+                                request_id=payload.oauth_request_id,
+                                user_id=user_id,
+                                agent_id=agent_id,
+                                credential_id=credential.id,
+                            )
+                            _logger.info(
+                                "agent_link_created",
+                                extra={
+                                    "event": "agent_link_created",
+                                    "request_id": payload.oauth_request_id,
+                                    "user_id": user_id,
+                                    "agent_id": agent_id,
+                                    "credential_id": credential.id,
+                                },
+                            )
+                        elif agent_link_updated:
+                            log_event(
+                                "link_updated",
+                                request_id=payload.oauth_request_id,
+                                user_id=user_id,
+                                agent_id=agent_id,
+                                credential_id=credential.id,
+                            )
+                            _logger.info(
+                                "agent_link_updated",
+                                extra={
+                                    "event": "agent_link_updated",
+                                    "request_id": payload.oauth_request_id,
+                                    "user_id": user_id,
+                                    "agent_id": agent_id,
+                                    "credential_id": credential.id,
+                                },
+                            )
 
                 if invalid_state:
                     record_anomaly("vault_invalid_state")
+                    log_event(
+                        "invalid_state",
+                        request_id=payload.oauth_request_id,
+                        user_id=int(request_payload["user_id"]),
+                        invalid_reason=invalid_reason,
+                    )
+                    _logger.error(
+                        "oauth_callback_invalid_state",
+                        extra={
+                            "event": "invalid_state",
+                            "request_id": payload.oauth_request_id,
+                            "user_id": int(request_payload["user_id"]),
+                            "invalid_reason": invalid_reason,
+                        },
+                    )
                     tool_names = request_payload.get("tool_names") or []
                     user = db.get(User, int(request_payload["user_id"]))
                     if user and tool_names:
@@ -228,6 +424,8 @@ async def oauth_vault_callback(
                     metadata={
                         "provider": payload.provider,
                         "agent_id": request_payload.get("agent_id"),
+                        "agent_link_created": agent_link_created,
+                        "agent_link_updated": agent_link_updated,
                         "request_id": payload.oauth_request_id,
                         "created": created,
                         "invalid_state": invalid_state,
@@ -237,6 +435,14 @@ async def oauth_vault_callback(
         except Exception as exc:
             record_vault_failure()
             log_event("vault_callback_failed", request_id=payload.oauth_request_id, error=str(exc))
+            _logger.error(
+                "oauth_callback_failed",
+                extra={
+                    "event": "oauth_callback_failed",
+                    "request_id": payload.oauth_request_id,
+                    "error": str(exc),
+                },
+            )
             raise
 
         latency_ms = (time.monotonic() - start_time) * 1000.0

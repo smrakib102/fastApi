@@ -200,10 +200,24 @@ def _mark_run_failed(run_id: int, reason: str) -> None:
     soft_time_limit=settings.agent_tool_timeout_seconds,
     time_limit=settings.agent_tool_kill_switch_seconds,
 )
-def execute_tool_task(self, tool_name: str, tool_args: dict, internal_user_id: int, internal_agent_id: int | None):
+def execute_tool_task(
+    self,
+    tool_name: str,
+    tool_args: dict,
+    internal_user_id: int,
+    internal_agent_id: int | None,
+    auth_context: dict | None = None,
+):
     db = SessionLocal()
     try:
-        return execute_tool_local(db, tool_name, tool_args, internal_user_id, internal_agent_id)
+        return execute_tool_local(
+            db,
+            tool_name,
+            tool_args,
+            internal_user_id,
+            internal_agent_id,
+            auth_context,
+        )
     except ToolExecutionError as exc:
         # S1: Retry with backoff; on final exhaustion, re-raise so the
         # caller (agent_executor._execute_via_worker) propagates the

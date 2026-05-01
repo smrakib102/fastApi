@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
@@ -13,6 +14,7 @@ from app.core.config import settings
 from app.core.redis_client import get_redis
 from app.worker.celery_app import celery_app
 from app.models.approval import Approval
+from app.services.credential_resolver import CredentialContext, CredentialResult, resolve_credential
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,22 @@ def _trigger_reconnect(db: Session, tool_name: str, user_id: int) -> None:
         logger.debug("oauth_reconnect_request_failed", extra={"tool": tool_name})
 
 
+def _build_auth_context(result: CredentialResult) -> dict:
+    return {
+        "access_token": result.access_token,
+        "refresh_token": result.refresh_token,
+        "source": result.source,
+        "scopes": sorted(result.scopes),
+        "status": result.status,
+        "credential_id": result.credential_id,
+        "trace": {
+            "selection_reason": result.trace.selection_reason,
+            "fallback_triggered": result.trace.fallback_triggered,
+            "scope_check_result": result.trace.scope_check_result,
+        },
+    }
+
+
 def execute_tool(
     db: Session,
     name: str,
@@ -110,7 +128,23 @@ def execute_tool(
 
     for attempt in range(retries + 1):
         try:
-            result = _execute_via_worker(name, args, internal_user_id, internal_agent_id)
+            credential_result = resolve_credential(
+                CredentialContext(
+                    user_id=internal_user_id,
+                    agent_id=internal_agent_id,
+                    tool_name=name,
+                    execution_id=str(uuid.uuid4()),
+                    retry_count=attempt,
+                )
+            )
+            auth_context = _build_auth_context(credential_result)
+            result = _execute_via_worker(
+                name,
+                args,
+                internal_user_id,
+                internal_agent_id,
+                auth_context,
+            )
             _record_tool_success(name)
             return result
         except HTTPException as exc:
@@ -143,10 +177,26 @@ def execute_tool_local(
     args: dict,
     internal_user_id: int,
     internal_agent_id: int | None,
+    auth_context: dict | None = None,
 ) -> dict:
     _ensure_approval(db, name, args, internal_user_id)
     _validate_tool_schema(db, name, args)
-    payload = tool_routes.ToolExecuteRequest(name=name, arguments=args)
+    if auth_context is None:
+        credential_result = resolve_credential(
+            CredentialContext(
+                user_id=internal_user_id,
+                agent_id=internal_agent_id,
+                tool_name=name,
+                execution_id=str(uuid.uuid4()),
+                retry_count=0,
+            )
+        )
+        auth_context = _build_auth_context(credential_result)
+    payload = tool_routes.ToolExecuteRequest(
+        name=name,
+        arguments=args,
+        auth_context=auth_context,
+    )
     return _execute_with_timeout(payload, db, name, internal_user_id, internal_agent_id)
 
 
@@ -178,10 +228,11 @@ def _execute_via_worker(
     args: dict,
     internal_user_id: int,
     internal_agent_id: int | None,
+    auth_context: dict,
 ) -> dict:
     result = celery_app.send_task(
         "app.worker.tasks.execute_tool_task",
-        args=[name, args, internal_user_id, internal_agent_id],
+        args=[name, args, internal_user_id, internal_agent_id, auth_context],
         queue="tool_calls",
     )
     try:

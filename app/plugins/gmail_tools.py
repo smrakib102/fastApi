@@ -30,7 +30,7 @@ def _wrap(handler):
 def _draft(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _gmail_draft
 
-    return _gmail_draft(args, ctx.db, ctx.user_id)
+    return _gmail_draft(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _send_request(args: dict, ctx: ToolContext) -> dict:
@@ -42,25 +42,25 @@ def _send_request(args: dict, ctx: ToolContext) -> dict:
 def _send(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _gmail_send
 
-    return _gmail_send(args, ctx.db, ctx.user_id)
+    return _gmail_send(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _profile(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _gmail_profile
 
-    return _gmail_profile(ctx.db, ctx.user_id)
+    return _gmail_profile(ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _list_messages(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _gmail_list_messages
 
-    return _gmail_list_messages(args, ctx.db, ctx.user_id)
+    return _gmail_list_messages(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def _list_drafts(args: dict, ctx: ToolContext) -> dict:
     from app.api.routes.tools import _gmail_list_drafts
 
-    return _gmail_list_drafts(args, ctx.db, ctx.user_id)
+    return _gmail_list_drafts(args, ctx.db, ctx.user_id, ctx.extras.get("auth_context"))
 
 
 def register(registry) -> None:

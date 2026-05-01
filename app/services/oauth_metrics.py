@@ -90,6 +90,18 @@ def record_vault_write_latency(latency_ms: float) -> None:
     _increment_count("vault_latency_count")
 
 
+def record_refresh_result(success: bool) -> None:
+    _increment_count("refresh_success" if success else "refresh_failure")
+
+
+def record_scope_block_event() -> None:
+    _increment_count("scope_block_events")
+
+
+def record_reconnect_trigger() -> None:
+    _increment_count("reconnect_triggers")
+
+
 def get_metrics_snapshot() -> dict[str, Any]:
     redis_client = get_redis()
     window = _current_window()
@@ -104,6 +116,10 @@ def get_metrics_snapshot() -> dict[str, Any]:
         "vault_failure": _window_key("vault_failure", window),
         "vault_latency_sum_ms": _window_key("vault_latency_sum_ms", window),
         "vault_latency_count": _window_key("vault_latency_count", window),
+        "refresh_success": _window_key("refresh_success", window),
+        "refresh_failure": _window_key("refresh_failure", window),
+        "scope_block_events": _window_key("scope_block_events", window),
+        "reconnect_triggers": _window_key("reconnect_triggers", window),
     }
     raw = redis_client.mget(list(keys.values()))
     data = dict(zip(keys.keys(), raw, strict=False))
@@ -130,8 +146,13 @@ def get_metrics_snapshot() -> dict[str, Any]:
     vault_failure = _to_int(data["vault_failure"])
     vault_latency_sum = _to_float(data["vault_latency_sum_ms"])
     vault_latency_count = max(1, _to_int(data["vault_latency_count"]))
+    refresh_success = _to_int(data["refresh_success"])
+    refresh_failure = _to_int(data["refresh_failure"])
+    scope_block_events = _to_int(data["scope_block_events"])
+    reconnect_triggers = _to_int(data["reconnect_triggers"])
 
     total_callbacks = callback_success + callback_failure
+    refresh_total = refresh_success + refresh_failure
     return {
         "window_seconds": settings.oauth_metrics_window_seconds,
         "callback_success": callback_success,
@@ -144,6 +165,9 @@ def get_metrics_snapshot() -> dict[str, Any]:
         "callback_latency_avg_ms": callback_latency_sum / callback_latency_count,
         "vault_failure": vault_failure,
         "vault_latency_avg_ms": vault_latency_sum / vault_latency_count,
+        "refresh_success_rate": (refresh_success / refresh_total) if refresh_total else 0.0,
+        "scope_block_events": scope_block_events,
+        "reconnect_triggers": reconnect_triggers,
         "kill_switch_enabled": is_kill_switch_enabled(),
     }
 
