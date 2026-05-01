@@ -44,6 +44,10 @@ const handler = NextAuth({
             if (parsed.searchParams.has("state") || parsed.searchParams.has("oauth_request_id")) {
               console.warn("callback_url_state_ignored");
             }
+            console.warn("shadow_callback_url", {
+              has_callback_url: true,
+              has_callback_request_id: Boolean(callbackRequestId)
+            });
           } catch {
             console.warn("callback_url_parse_failed");
           }
@@ -93,7 +97,12 @@ const handler = NextAuth({
           .update(message)
           .digest("hex");
 
-        const response = await fetch(process.env.NEXTAUTH_VAULT_CALLBACK_URL || "", {
+        const vaultUrl = process.env.NEXTAUTH_VAULT_CALLBACK_URL || "";
+        console.warn("vault_callback_attempt", {
+          has_vault_url: Boolean(vaultUrl),
+          has_oauth_request_id: Boolean(state)
+        });
+        const response = await fetch(vaultUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -102,6 +111,9 @@ const handler = NextAuth({
             "X-Signature": signature
           },
           body
+        });
+        console.warn("vault_callback_response", {
+          status: response.status
         });
         if (!response.ok) {
           try {
@@ -114,7 +126,10 @@ const handler = NextAuth({
             console.warn("vault_callback_non_json_error");
           }
         }
-      } catch {
+      } catch (error) {
+        console.warn("vault_callback_exception", {
+          message: error instanceof Error ? error.message : String(error)
+        });
         return true;
       }
       return true;
