@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
 import httpx
 import secrets
@@ -91,6 +91,11 @@ def _build_nextauth_signin_url(request_id: str, provider: str, callback_url: str
         raise HTTPException(status_code=500, detail="NextAuth base URL not configured")
 
     base_url = settings.nextauth_base_url.rstrip("/")
+    if callback_url:
+        parsed = urlparse(callback_url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["oauth_request_id"] = request_id
+        callback_url = urlunparse(parsed._replace(query=urlencode(query)))
     params = {"request_id": request_id, "provider": provider}
     if callback_url:
         params["callbackUrl"] = callback_url

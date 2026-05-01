@@ -32,9 +32,11 @@ const handler = NextAuth({
       }
       try {
         const callbackUrl = cookies().get("next-auth.callback-url")?.value;
+        let callbackRequestId = "";
         if (callbackUrl) {
           try {
             const parsed = new URL(callbackUrl);
+            callbackRequestId = parsed.searchParams.get("oauth_request_id")?.trim() || "";
             if (parsed.searchParams.has("state") || parsed.searchParams.has("oauth_request_id")) {
               console.warn("callback_url_state_ignored");
             }
@@ -47,13 +49,19 @@ const handler = NextAuth({
         let state = rawState.trim();
         let cookieState = "";
         if (!state) {
+          if (callbackRequestId) {
+            state = callbackRequestId;
+          }
+        }
+        if (!state) {
           cookieState = cookies().get("shadow_oauth_request_id")?.value?.trim() || "";
           state = cookieState;
         }
         if (!state) {
           console.warn("shadow_state_missing", {
             has_account_state: Boolean(rawState),
-            has_cookie_state: Boolean(cookieState)
+            has_cookie_state: Boolean(cookieState),
+            has_callback_request_id: Boolean(callbackRequestId)
           });
         }
         const stateRegex = getOAuthRequestIdRegex();
